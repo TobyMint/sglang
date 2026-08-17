@@ -71,6 +71,16 @@ struct SparseAttnDecodeParams {
   int* __restrict__ topk_length;         // [b], may be nullptr
   float* __restrict__ attn_sink;         // [h_q], may be nullptr
 
+  // FP8-MMA variant: wrapper-quantized Q.  NoPE as E4M3 with per-head
+  // power-of-two shifts (q_shift multiplies the raw E4M3 partial scores
+  // back up — exact); RoPE stays BF16.  Null in the BF16-MMA variant.
+  cutlass::float_e4m3_t* __restrict__ q_nope_fp8;  // [b, s_q, h_q, 448]
+  cutlass::bfloat16_t* __restrict__ q_rope;        // [b, s_q, h_q, 64]
+  float* __restrict__ q_shift;                     // [b, s_q, h_q]
+  int stride_q8_b, stride_q8_s_q, stride_q8_h_q;
+  int stride_qrope_b, stride_qrope_s_q, stride_qrope_h_q;
+  int stride_qshift_b, stride_qshift_s_q;
+
   float* __restrict__ lse;                // [b, s_q, h_q]
   cutlass::bfloat16_t* __restrict__ out;  // [b, s_q, h_q, d_v]
 
