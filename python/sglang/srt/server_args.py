@@ -711,7 +711,22 @@ class ServerArgs:
             ),
             choices=["nvfp4", "mxfp4"],
         ),
+        NS("model"),
     ] = "mxfp4"
+    fp4_kv_group_size: A[
+        int,
+        Arg(
+            help=(
+                "Quantization group size (dims per E8M0 scale) for the mxfp4 "
+                "FP4 KV-cache recipe. The scale is replicated into every "
+                "per-32-dim slot it covers, so the stored layout is "
+                "identical for all values; only the quantization granularity "
+                "changes."
+            ),
+            choices=[32, 64, 128],
+        ),
+        NS("model"),
+    ] = 32
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
     ] = False

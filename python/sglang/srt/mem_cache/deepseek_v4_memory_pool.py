@@ -72,6 +72,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         device: str,
         enable_memory_saver: bool,
         use_mxfp4: bool = False,
+        mxfp4_group_size: int = 32,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
@@ -88,6 +89,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
+        self.mxfp4_group_size = mxfp4_group_size
         if self.dsv4_kv_cache_store_mxfp4:
             if qk_nope_head_dim != 448 or qk_rope_head_dim != 64:
                 raise ValueError(
@@ -177,6 +179,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                 kv_buffer=self.kv_buffer[layer_id],
                 loc=loc,
                 page_size=self.page_size,
+                group_size=self.mxfp4_group_size,
             )
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
@@ -197,6 +200,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                 kv_buffer=self.kv_buffer[layer_id],
                 loc=loc,
                 page_size=self.page_size,
+                group_size=self.mxfp4_group_size,
             )
         return fused_store_cache(
             input=cache_k,
@@ -237,6 +241,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         device: str,
         enable_memory_saver: bool,
         use_mxfp4: bool = False,
+        mxfp4_group_size: int = 32,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
@@ -255,6 +260,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             use_mxfp4=use_mxfp4,
+            mxfp4_group_size=mxfp4_group_size,
             start_layer=start_layer,
             end_layer=end_layer,
         )
@@ -546,6 +552,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
         use_mxfp4: bool = False,
+        mxfp4_group_size: int = 32,
     ):
         super().__init__(
             swa_size,
@@ -627,6 +634,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Decided by the caller from kv_cache_dtype/fp4_kv_cache_recipe; the
         # pool no longer reads environment variables directly.
         self.dsv4_kv_cache_store_mxfp4 = use_mxfp4
+        self.mxfp4_group_size = mxfp4_group_size
 
         stage_layer_num = len(stage_ratios)
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)
@@ -676,6 +684,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
                 use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
+                mxfp4_group_size=self.mxfp4_group_size,
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
@@ -702,6 +711,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
                 use_mxfp4=self.dsv4_kv_cache_store_mxfp4,
+                mxfp4_group_size=self.mxfp4_group_size,
             )
 
         indexer_size = self.c4_logical_size
@@ -902,6 +912,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_memory_saver: bool,
         global_page_size: int,
         use_mxfp4: bool = False,
+        mxfp4_group_size: int = 32,
         cls: type = DeepSeekV4SingleKVPool,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
@@ -920,6 +931,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             device,
             enable_memory_saver,
             use_mxfp4=use_mxfp4,
+            mxfp4_group_size=mxfp4_group_size,
         )
 
     def _make_indexer_pool(

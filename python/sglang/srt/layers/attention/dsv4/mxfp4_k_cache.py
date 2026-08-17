@@ -30,6 +30,12 @@ MXFP4_NOPE_DIM = 448
 MXFP4_ROPE_DIM = 64
 MXFP4_TOTAL_DIM = MXFP4_NOPE_DIM + MXFP4_ROPE_DIM  # 512
 MXFP4_NUM_GROUPS = MXFP4_NOPE_DIM // MXFP4_GROUP_SIZE  # 14
+# Quantization group sizes the codec supports.  The 368-byte row always holds
+# 14 per-32-dim scale slots; a coarser group writes its E8M0 byte into every
+# slot it covers (2 slots for 64, 4 for 128), so readers that index scales per
+# 32-dim slot (Triton dequant, the CUDA decode kernel) work for any setting.
+# 448 = 14x32 = 7x64 = 3x128 + 64: the last 128-group covers only 64 dims.
+MXFP4_QUANT_GROUP_SIZES = (32, 64, 128)
 MXFP4_PACKED_NOPE_BYTES = MXFP4_NOPE_DIM // 2  # 224
 MXFP4_SCALE_BYTES = MXFP4_NUM_GROUPS + 2  # 16 (14 + 2 pad)
 MXFP4_ROPE_BYTES = MXFP4_ROPE_DIM * 2  # 128
@@ -53,10 +59,22 @@ _QUANTIZE_LARGE_GROUPS_PER_PROGRAM = 8  # two CTAs per token
 _QUANTIZE_LARGE_NUM_WARPS = 2
 
 
-def _quantize_launch_config(num_tokens: int) -> tuple[int, int]:
-    if num_tokens <= _QUANTIZE_SMALL_BATCH_THRESHOLD:
-        return _QUANTIZE_SMALL_GROUPS_PER_PROGRAM, _QUANTIZE_SMALL_NUM_WARPS
-    return _QUANTIZE_LARGE_GROUPS_PER_PROGRAM, _QUANTIZE_LARGE_NUM_WARPS
+def _quantize_launch_config(num_tokens: int, group_size: int) -> tuple[int, int]:
+    num_warps = (
+        _QUANTIZE_SMALL_NUM_WARPS
+        if num_tokens <= _QUANTIZE_SMALL_BATCH_THRESHOLD
+        else _QUANTIZE_LARGE_NUM_WARPS
+    )
+    if group_size == MXFP4_GROUP_SIZE:
+        groups_per_program = (
+            _QUANTIZE_SMALL_GROUPS_PER_PROGRAM
+            if num_tokens <= _QUANTIZE_SMALL_BATCH_THRESHOLD
+            else _QUANTIZE_LARGE_GROUPS_PER_PROGRAM
+        )
+        return groups_per_program, num_warps
+    # Coarser groups: 4 groups at 128, 7 at 64 — one program covers them all.
+    num_groups = -(-MXFP4_NOPE_DIM // group_size)
+    return max(triton.next_power_of_2(num_groups), 1), num_warps
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +263,8 @@ def _quantize_mxfp4_k_cache_into_kernel(
     GROUP_SIZE: tl.constexpr,
     GROUPS_PER_PROGRAM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     part_id = tl.program_id(1)
@@ -253,16 +273,19 @@ def _quantize_mxfp4_k_cache_into_kernel(
     safe_row = tl.where(valid_dst, dst_row, 0)
 
     group_start = part_id * GROUPS_PER_PROGRAM
-    # tl.arange demands a power-of-two range; GROUPS_PER_PROGRAM ∈ {8, 16}.
+    # tl.arange demands a power-of-two range; GROUPS_PER_PROGRAM ∈ {4, 8, 16}.
     group_ids = group_start + tl.arange(0, GROUPS_PER_PROGRAM)  # [GROUPS_PER_PROGRAM]
     valid_group = group_ids < NUM_GROUPS
-    elem_ids = tl.arange(0, GROUP_SIZE)  # [32]  ← power of two
+    elem_ids = tl.arange(0, GROUP_SIZE)  # [GROUP_SIZE]  ← power of two
 
-    # Load [GROUPS_PER_PROGRAM, 32] elements of k_nope
+    # Load [GROUPS_PER_PROGRAM, GROUP_SIZE] elements of k_nope.  With
+    # GROUP_SIZE=128 the last group covers only 64 dims (448 = 3x128 + 64);
+    # the offset mask trims it, and the masked-out lanes load 0.0 so the
+    # group amax is unaffected.
     input_offsets = group_ids[:, None] * GROUP_SIZE + elem_ids[None, :]
     x = tl.load(
         k_nope_ptr + token_id * k_nope_stride_0 + input_offsets,
-        mask=valid_dst & valid_group[:, None],
+        mask=valid_dst & valid_group[:, None] & (input_offsets < NOPE_DIM),
         other=0.0,
     ).to(tl.float32)
 
@@ -278,25 +301,33 @@ def _quantize_mxfp4_k_cache_into_kernel(
     # E2M1 RNE: compare original values against scaled midpoints (no division)
     scale_float = tl.math.exp2((scale_byte.to(tl.float32) - 127.0))
     denominator = tl.expand_dims(scale_float, 1)
-    codes = _e2m1_rne_scaled_triton(x, denominator)  # [GROUPS_PER_PROGRAM, 32] uint8
+    codes = _e2m1_rne_scaled_triton(
+        x, denominator
+    )  # [GROUPS_PER_PROGRAM, GROUP_SIZE] uint8
 
     # Pack nibbles: two adjacent E2M1 codes → one byte
     codes_2d = tl.reshape(codes, (GROUPS_PER_PROGRAM, GROUP_SIZE // 2, 2))
-    low, high = tl.split(codes_2d)  # each [GROUPS_PER_PROGRAM, 16]
+    low, high = tl.split(codes_2d)  # each [GROUPS_PER_PROGRAM, GROUP_SIZE // 2]
     packed = low | (high << 4)
 
-    # Store packed nope: [GROUPS_PER_PROGRAM, 16] bytes per token
-    byte_ids = tl.arange(0, GROUP_SIZE // 2)  # [16]
+    # Store packed nope: [GROUPS_PER_PROGRAM, GROUP_SIZE // 2] bytes per token
+    byte_ids = tl.arange(0, GROUP_SIZE // 2)
     packed_offsets = group_ids[:, None] * (GROUP_SIZE // 2) + byte_ids[None, :]
     tl.store(
         packed_out_ptr + safe_row * packed_out_stride_0 + packed_offsets,
         packed,
-        mask=valid_dst & valid_group[:, None],
+        mask=valid_dst & valid_group[:, None] & (packed_offsets < NOPE_DIM // 2),
+    )
+    # Store scales: one E8M0 byte per quant group, replicated into every
+    # 32-dim scale slot the group covers (SCALE_STRIDE = GROUP_SIZE / 32), so
+    # readers indexing scales per 32-dim slot stay group-size agnostic.
+    slot_offsets = (
+        group_ids[:, None] * SCALE_STRIDE + tl.arange(0, SCALE_STRIDE)[None, :]
     )
     tl.store(
-        scale_out_ptr + safe_row * scale_out_stride_0 + group_ids,
-        scale_byte,
-        mask=valid_dst & valid_group,
+        scale_out_ptr + safe_row * scale_out_stride_0 + slot_offsets,
+        tl.broadcast_to(scale_byte[:, None], (GROUPS_PER_PROGRAM, SCALE_STRIDE)),
+        mask=valid_dst & valid_group[:, None] & (slot_offsets < NOPE_DIM // 32),
     )
 
     # RoPE: written once by the last part
@@ -404,22 +435,37 @@ def _quantize_mxfp4_reference(
     scale_rows: torch.Tensor,
     rope_rows: torch.Tensor,
     loc: torch.Tensor,
+    group_size: int = MXFP4_GROUP_SIZE,
 ) -> None:
     """CPU reference: quantize + scatter into destination views."""
-    blocks = k_nope.float().reshape(-1, MXFP4_NUM_GROUPS, MXFP4_GROUP_SIZE)
-    amax = blocks.abs().amax(dim=-1)  # [N, 14]
-    log2_ratio = torch.log2(amax.clamp(min=1e-40)) - 2.584962500721156
-    scale_byte = (log2_ratio.round().long() + 127).clamp(0, 255).to(torch.uint8)
-    scale_float = torch.pow(2.0, (scale_byte.float() - 127.0))
-    denominator = scale_float.unsqueeze(-1)
-    codes = _e2m1_rne_scaled_torch(blocks, denominator).reshape(-1, MXFP4_NOPE_DIM)
+    num_groups = -(-MXFP4_NOPE_DIM // group_size)  # ceil; 128 → 4 (last covers 64)
+    scale_stride = group_size // MXFP4_GROUP_SIZE  # 32-dim slots covered per group
+    num_slots = MXFP4_NOPE_DIM // MXFP4_GROUP_SIZE  # 14
+
+    x = k_nope.float()
+    codes = torch.empty(x.shape[0], MXFP4_NOPE_DIM, dtype=torch.uint8)
+    scale_byte = torch.empty(x.shape[0], num_groups, dtype=torch.uint8)
+    for g in range(num_groups):
+        start = g * group_size
+        block = x[:, start : min(start + group_size, MXFP4_NOPE_DIM)]
+        amax = block.abs().amax(dim=-1)
+        log2_ratio = torch.log2(amax.clamp(min=1e-40)) - 2.584962500721156
+        sbyte = (log2_ratio.round().long() + 127).clamp(0, 255).to(torch.uint8)
+        denominator = torch.pow(2.0, sbyte.float() - 127.0).unsqueeze(-1)
+        codes[:, start : start + block.shape[1]] = _e2m1_rne_scaled_torch(
+            block, denominator
+        )
+        scale_byte[:, g] = sbyte
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
 
     valid = (loc >= 0) & (loc < packed_rows.shape[0])
     if bool(valid.any()):
         dst = loc[valid].long()
         packed_rows[dst] = packed[valid]
-        scale_rows[dst, :MXFP4_NUM_GROUPS] = scale_byte[valid]
+        # Replicate each group's scale into every 32-dim slot it covers so the
+        # stored row matches the Triton kernel's write pattern.
+        group_of_slot = torch.arange(num_slots) // scale_stride
+        scale_rows[dst, :num_slots] = scale_byte[valid][:, group_of_slot]
         rope_rows[dst] = k_rope[valid].to(torch.bfloat16)
 
 
@@ -471,6 +517,7 @@ def quantize_dsv4_mxfp4_k_cache_into(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     page_size: int,
+    group_size: int = MXFP4_GROUP_SIZE,
 ) -> None:
     """Quantize BF16/FP16/FP32 DSV4 keys → MXFP4 and scatter by token ID.
 
@@ -479,7 +526,15 @@ def quantize_dsv4_mxfp4_k_cache_into(
         kv_buffer: [num_pages, page_size * 368] uint8 — destination pool.
         loc:       [num_tokens] int32/int64 — flat row index per token.
         page_size: tokens per page (typically 128 or 256).
+        group_size: quantization group size, one of (32, 64, 128).  The E8M0
+          scale of each group is replicated into every 32-dim scale slot it
+          covers, so the 368-byte row layout and all readers are identical
+          across settings; only the quantization granularity changes.
     """
+    if group_size not in MXFP4_QUANT_GROUP_SIZES:
+        raise ValueError(
+            f"group_size must be one of {MXFP4_QUANT_GROUP_SIZES}, got {group_size}"
+        )
     k_nope, k_rope = _split_k(cache_k)
     rows = _as_rows(kv_buffer, page_size)
     loc = _validate_loc(loc, rows)
@@ -501,8 +556,9 @@ def quantize_dsv4_mxfp4_k_cache_into(
     rope_rows = rows[:, -MXFP4_ROPE_BYTES:].view(torch.bfloat16)
 
     if rows.is_cuda:
-        groups_per_program, num_warps = _quantize_launch_config(loc.numel())
-        num_parts = triton.cdiv(MXFP4_NUM_GROUPS, groups_per_program)
+        num_groups = -(-MXFP4_NOPE_DIM // group_size)
+        groups_per_program, num_warps = _quantize_launch_config(loc.numel(), group_size)
+        num_parts = triton.cdiv(num_groups, groups_per_program)
         _quantize_mxfp4_k_cache_into_kernel[(loc.numel(), num_parts)](
             k_nope,
             k_rope,
@@ -516,15 +572,17 @@ def quantize_dsv4_mxfp4_k_cache_into(
             packed_rows.stride(0),
             scale_rows.stride(0),
             rope_rows.stride(0),
-            NUM_GROUPS=MXFP4_NUM_GROUPS,
-            GROUP_SIZE=MXFP4_GROUP_SIZE,
+            NUM_GROUPS=num_groups,
+            GROUP_SIZE=group_size,
             GROUPS_PER_PROGRAM=groups_per_program,
             ROPE_DIM=MXFP4_ROPE_DIM,
+            NOPE_DIM=MXFP4_NOPE_DIM,
+            SCALE_STRIDE=group_size // MXFP4_GROUP_SIZE,
             num_warps=num_warps,
         )
     else:
         _quantize_mxfp4_reference(
-            k_nope, k_rope, packed_rows, scale_rows, rope_rows, loc
+            k_nope, k_rope, packed_rows, scale_rows, rope_rows, loc, group_size
         )
 
 
@@ -601,6 +659,7 @@ __all__ = [
     "MXFP4_TOTAL_DIM",
     "MXFP4_GROUP_SIZE",
     "MXFP4_NUM_GROUPS",
+    "MXFP4_QUANT_GROUP_SIZES",
     "MXFP4_PACKED_NOPE_BYTES",
     "MXFP4_SCALE_BYTES",
     "MXFP4_ROPE_BYTES",

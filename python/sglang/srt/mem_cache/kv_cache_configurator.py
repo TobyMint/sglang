@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -1127,6 +1128,7 @@ class KVCacheConfigurator:
             # The recipe is validated in the DeepSeek V4 kv_cache_dtype
             # override, so a float4_e2m1fn_x2 dtype here implies mxfp4.
             use_mxfp4=is_float4_e2m1fn_x2(self.kv_cache_dtype),
+            mxfp4_group_size=get_model().fp4_kv_group_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
             qk_nope_head_dim=self.model_config.qk_nope_head_dim,
