@@ -88,14 +88,14 @@ class KernelTemplate {
   // decomposed QK/PV are pairs of 64-dim tiles (dims 0-127 / 128-255 /
   // 256-383) plus the single tail tile (384-447).
   using Fp8T = cutlass::float_e4m3_t;
-  using SmemLayoutK8Tile = decltype(tile_to_shape(
-      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64>>{}, Step<_1, _2>{}));
+  using SmemLayoutK8Tile =
+      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64>>{}, Step<_1, _2>{}));
   template <int NUM_TILES>
-  using SmemLayoutK8Tiles = decltype(tile_to_shape(
-      SmemLayoutK8Tile{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
+  using SmemLayoutK8Tiles =
+      decltype(tile_to_shape(SmemLayoutK8Tile{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
   using SmemLayoutK8 = SmemLayoutK8Tiles<HEAD_DIM_NOPE / 64>;
-  using SmemLayoutQ8Tile = decltype(tile_to_shape(
-      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<64>>{}, Step<_1, _2>{}));
+  using SmemLayoutQ8Tile =
+      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<64>>{}, Step<_1, _2>{}));
   template <int NUM_TILES>
   using SmemLayoutQ8Tiles =
       decltype(tile_to_shape(SmemLayoutQ8Tile{}, Shape<Int<BLOCK_M>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
@@ -125,10 +125,11 @@ class KernelTemplate {
   // FP8 K/V staging buffer: E2M1 payload as E4M3 (28 KB), the BF16 RoPE
   // payload (8 KB), and the four per-token 128-dim block scales converted
   // to float (the producer reads scale slots 0/4/8/12 of the 14-byte row).
+  // Token-major so one token's four scales are a contiguous float4.
   struct Fp8KBuf {
     array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;
     array_aligned<bf16, cosize_v<SmemLayoutKRope>> rope;
-    float block_scale[4][TOPK_BLOCK_SIZE];
+    float block_scale[TOPK_BLOCK_SIZE][4];
   };
 
   struct SharedMemoryPlanFp8 {
@@ -177,12 +178,12 @@ class KernelTemplate {
   // come as fixed-orientation _TN variants (A K-major, ScaleIn defaults).
   // Unused until the mainloop fork lands; declared here so the atom/layout
   // availability is pinned by compilation.
-  using TiledMMA_QK_Fp8 = decltype(make_tiled_mma(
-      GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
-  using TiledMMA_PV_LocalP_Fp8 = decltype(make_tiled_mma(
-      GMMA::MMA_64x256x32_F32E4M3E4M3_RS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
-  using TiledMMA_PV_RemoteP_Fp8 = decltype(make_tiled_mma(
-      GMMA::MMA_64x256x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  using TiledMMA_QK_Fp8 =
+      decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  using TiledMMA_PV_LocalP_Fp8 =
+      decltype(make_tiled_mma(GMMA::MMA_64x256x32_F32E4M3E4M3_RS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  using TiledMMA_PV_RemoteP_Fp8 =
+      decltype(make_tiled_mma(GMMA::MMA_64x256x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
 
   enum NamedBarriers : uint32_t {
     sScale_and_sS_ready = 0,
