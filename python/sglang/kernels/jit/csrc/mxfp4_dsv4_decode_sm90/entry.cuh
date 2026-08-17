@@ -200,6 +200,9 @@ void mxfp4_dsv4_decode_dispatch(
     tvm::ffi::TensorView o_accum,
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView lse,
+    tvm::ffi::TensorView q_nope_fp8,
+    tvm::ffi::TensorView q_rope,
+    tvm::ffi::TensorView q_shift,
     int64_t head_dim_v,
     double sm_scale,
     int64_t generate_sched_meta) {
@@ -339,7 +342,32 @@ void mxfp4_dsv4_decode_dispatch(
   params.num_splits_ptr = static_cast<int*>(num_splits.data_ptr());
   params.num_sm_parts = num_sm_parts;
 
-  sm90::decode::sparse_mxfp4_dsv4::run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel(params);
+  // FP8-MMA variant: the wrapper passes the pre-quantized Q tensors (empty
+  // views select the BF16-MMA path).  h_q=64 only until the CLUSTER_SIZE==2
+  // producer lands; the KV cache must carry 128-dim quantization groups so
+  // the decomposed scales read from slots 0/4/8/12 are the block scales.
+  if (!is_empty(q_nope_fp8)) {
+    if (h_q != 64) {
+      fail("FP8-MMA decode currently requires h_q=64");
+    }
+    if (q_nope_fp8.shape()[3] != 448 || q_rope.shape()[3] != 64) {
+      fail("FP8-MMA Q tensors must be [b, s_q, h_q, 448/64]");
+    }
+    params.q_nope_fp8 = reinterpret_cast<cutlass::float_e4m3_t*>(q_nope_fp8.data_ptr());
+    params.q_rope = reinterpret_cast<cutlass::bfloat16_t*>(q_rope.data_ptr());
+    params.q_shift = static_cast<float*>(q_shift.data_ptr());
+    params.stride_q8_b = h_q * 448;
+    params.stride_q8_s_q = h_q * 448;
+    params.stride_q8_h_q = 448;
+    params.stride_qrope_b = h_q * 64;
+    params.stride_qrope_s_q = h_q * 64;
+    params.stride_qrope_h_q = 64;
+    params.stride_qshift_b = s_q * h_q;
+    params.stride_qshift_s_q = h_q;
+    sm90::decode::sparse_mxfp4_dsv4::run_flash_splitkv_mla_mxfp4_dsv4_sparse_fp8_mma_kernel_impl<64>(params);
+  } else {
+    sm90::decode::sparse_mxfp4_dsv4::run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel(params);
+  }
 
   CombineParams combine_params = {};
   combine_params.b = b;

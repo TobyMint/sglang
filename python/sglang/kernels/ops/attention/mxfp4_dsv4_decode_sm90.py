@@ -90,6 +90,17 @@ def _empty_f32(device: torch.device) -> torch.Tensor:
     return cached
 
 
+_EMPTY_U8: dict[Optional[int], torch.Tensor] = {}
+
+
+def _empty_u8(device: torch.device) -> torch.Tensor:
+    cached = _EMPTY_U8.get(device.index)
+    if cached is None:
+        cached = torch.empty(0, dtype=torch.uint8, device=device)
+        _EMPTY_U8[device.index] = cached
+    return cached
+
+
 # Split-K accumulators are per-step internal scratch. Reuse them across calls
 # with the same geometry: fixed addresses are also CUDA-graph friendly.
 _SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -167,6 +178,7 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    fp8_q: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run fused SM90 DeepSeek-V4 sparse decode on an MXFP4 KV cache.
 
@@ -310,8 +322,69 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
         o_accum,
         out,
         lse,
+        *(
+            fp8_q
+            if fp8_q is not None
+            else (_empty_u8(device), _empty_u8(device), _empty_f32(device))
+        ),  # q_nope_fp8 / q_rope / q_shift: empty selects the BF16-MMA path
         head_dim_v,
         softmax_scale,
         generate_sched_meta,
     )
     return out, lse.transpose(1, 2)
+
+
+def _quantize_q_for_fp8_mma(q: torch.Tensor):
+    """Split BF16 Q [b, s_q, h_q, 512] into E4M3 NoPE (with an exact
+    power-of-two per-head shift folded back into the scores), BF16 RoPE,
+    and the shift tensor.  All three are contiguous for the kernel."""
+    q_nope = q[..., :448].float()
+    amax = q_nope.abs().amax(dim=-1, keepdim=True).clamp(min=1e-30)
+    shift = torch.pow(2.0, torch.round(torch.log2(amax / 64.0)))
+    q8 = (q_nope / shift).to(torch.float8_e4m3fn)
+    q_rope = q[..., 448:].contiguous()
+    return (
+        q8.contiguous(),
+        q_rope,
+        shift.squeeze(-1).contiguous(),
+    )
+
+
+def flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    tile_scheduler_metadata: "FlashMLASchedMeta",
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+):
+    """FP8-WGMMA variant of flash_mla_with_kvcache_dsv4_mxfp4.
+
+    Requires h_q=64 and an MXFP4 KV cache quantized with 128-dim groups
+    (--fp4-kv-group-size 128): the block-decomposed E8M0 scales are read
+    from scale slots 0/4/8/12 of each row.
+    """
+    if q.shape[2] != 64:
+        raise ValueError(f"FP8-MMA decode requires h_q=64, got {q.shape[2]}")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    q8, q_rope, q_shift = _quantize_q_for_fp8_mma(q)
+
+    return flash_mla_with_kvcache_dsv4_mxfp4(
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        tile_scheduler_metadata,
+        softmax_scale=softmax_scale,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices_in_kvcache,
+        extra_topk_length=extra_topk_length,
+        fp8_q=(q8, q_rope, q_shift),
+    )

@@ -185,7 +185,8 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
     }
     NamedBarrier::arrive_and_wait(384, 15 /* scratch id, unused by the FP8 path */);
   };
-  stage_q(sched_meta.begin_req_idx);
+  // Q is staged per request inside each warpgroup's batch loop (all three
+  // branches rendezvous through the 384-thread named barrier).
 
   if (warpgroup_idx == 2) {
     // ------------------------------------------------------------------
@@ -370,7 +371,8 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
     float rL[2], rM[2], rK[2];
     Tensor rP = partition_fragment_C(tiled_mma_QK8, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
     Tensor acc = partition_fragment_C(tiled_mma_QK8, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
-    Tensor rS = make_tensor<bf16>(partition_shape_A(typename Kt::TiledMMA_PV_LocalP_Fp8{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
+    Tensor rS =
+        make_tensor<bf16>(partition_shape_A(typename Kt::TiledMMA_PV_LocalP{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
     Tensor rO0 = partition_fragment_C(tiled_mma_PV128, Shape<Int<BLOCK_M>, _128>{});
     Tensor rO1 = partition_fragment_C(tiled_mma_PV128, Shape<Int<BLOCK_M>, _128>{});
 
@@ -517,6 +519,10 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
           }
           CUTE_UNROLL
           for (int b = 0; b < 4; ++b) {
+            // Each 128-dim block gets its own 64x64 E4M3 tile.
+            Tensor sS8b = make_tensor(
+                make_smem_ptr(plan.s8.data() + b * cosize_v<typename Kt::SmemLayoutS8>),
+                typename Kt::SmemLayoutS8{});
             CUTE_UNROLL
             for (int lr = 0; lr < 2; ++lr) {
               Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
@@ -525,7 +531,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
               for (int i = 0; i < size(cur_rP); ++i) {
                 const int tok = (i & 1) + (i / 2) * 8 + (idx_in_warpgroup % 4) * 2;
                 const float v = cur_rP(i) * exp2f(k_row[lr]) * bscale[tok * 4 + b];
-                sS8buf(row, tok) = Fp8T(v);
+                sS8b(row, tok) = Fp8T(v);
               }
             }
           }
@@ -627,7 +633,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
         if (idx_in_warpgroup < num_valid_seq_q) {
           float cur_L = sL[idx_in_warpgroup];
           gLseAccum[idx_in_warpgroup] =
-              cur_L == 0.0f ? -INFINITY : log2f(cur_L) + sM[idx_in_warpgroup] - plan.sKrow[idx_in_warpgroup];
+              cur_L == 0.0f ? -INFINITY : log2f(cur_L) + sM[idx_in_warpgroup];
         }
       }
 
@@ -1421,12 +1427,27 @@ void KernelTemplate<NUM_HEADS, USE_FP8_MMA>::run(const SparseAttnDecodeParams& p
   }
 
   auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q, params.b);
-  auto tma_Q = cute::make_tma_copy(
-      SM90_TMA_LOAD{},
-      make_tensor(
-          make_gmem_ptr((bf16*)params.q),
-          make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q, params.stride_q_b))),
-      SmemLayoutQ{});
+  auto tma_Q = [&]() {
+    if constexpr (USE_FP8_MMA) {
+      // The FP8 mainloop stages Q cooperatively; the descriptor is only
+      // prefetched, so build it over the (valid) BF16 RoPE Q slice.
+      return cute::make_tma_copy(
+          SM90_TMA_LOAD{},
+          make_tensor(
+              make_gmem_ptr((bf16*)params.q_rope),
+              make_layout(make_shape(params.h_q, HEAD_DIM_ROPE, params.s_q, params.b),
+                          make_stride(params.stride_qrope_h_q, _1{}, params.stride_qrope_s_q, params.stride_qrope_b))),
+          SmemLayoutQRope{});
+    } else {
+      return cute::make_tma_copy(
+          SM90_TMA_LOAD{},
+          make_tensor(
+              make_gmem_ptr((bf16*)params.q),
+              make_layout(shape_Q, make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q, params.stride_q_b))),
+          SmemLayoutQ{});
+    }
+  }();
+  (void)shape_Q;
 
   CUtensorMap tensor_map_o;
   {
