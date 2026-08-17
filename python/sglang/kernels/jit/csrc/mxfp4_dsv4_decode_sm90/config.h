@@ -192,6 +192,10 @@ class KernelTemplate {
 
   using TiledMMA_PV_RemoteP = decltype(make_tiled_mma(
       GMMA::MMA_64x256x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
+  // RoPE-dim PV in the FP8 path: BF16 gemm over the transposed RoPE view
+  // (B is MN-major there, mirroring how the BF16 path feeds its transposed V).
+  using TiledMMA_RopePV = decltype(make_tiled_mma(
+      GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
 
   // FP8-MMA twins (Phase 2, block-decomposed-scale path): the K tile is
   // repacked E2M1→E4M3 (lossless, see dequant.h) and the E8M0 scales are

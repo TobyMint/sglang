@@ -637,7 +637,134 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
     return;
   }
 
-  if (cute::thread0()) CUTE_INVALID_CONTROL_PATH("FP8-MMA WG1 lands next");
+  // ---- WG1: PV over dims 256-383 (block 2), 384-447 (tail FP8), 448-511
+  // (RoPE BF16).  Mirrors the BF16 remote-PV warpgroup: reads the per-block
+  // E4M3 P̃ tiles and the BF16 P staged by WG0.
+  {
+    cutlass::arch::warpgroup_reg_dealloc<160>();
+
+    auto tiled_mma_PV128 = typename Kt::TiledMMA_PV128_Fp8{};
+    auto thr_PV128 = tiled_mma_PV128.get_slice(idx_in_warpgroup);
+    auto tiled_mma_PV64 = typename Kt::TiledMMA_QK_Fp8{};  // 64-wide tail block
+    auto thr_PV64 = tiled_mma_PV64.get_slice(idx_in_warpgroup);
+    auto tiled_mma_rope = typename Kt::TiledMMA_RopePV{};
+    auto thr_rope = tiled_mma_rope.get_slice(idx_in_warpgroup);
+
+    Tensor rO2 = partition_fragment_C(tiled_mma_PV128, Shape<Int<BLOCK_M>, _128>{});
+    Tensor rOt = partition_fragment_C(tiled_mma_PV64, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
+    Tensor rOr = partition_fragment_C(tiled_mma_rope, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
+
+#pragma unroll 1
+    for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
+      MainloopArgs args = get_cur_req_info(batch_idx);
+      stage_q(batch_idx);
+
+      cute::fill(rO2, 0.f);
+      cute::fill(rOt, 0.f);
+      cute::fill(rOr, 0.f);
+
+      CUTE_NO_UNROLL
+      for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+        const int buf_idx = (block_idx - args.start_block_idx) % NUM_K_BUFS;
+
+        NamedBarrier::arrive_and_wait(256, Kt::NamedBarriers::sScale_and_sS_ready);
+
+        // Rescale the running accumulators by WG0's softmax factor.
+        float cur_scales[2];
+        *(float2*)cur_scales = *(float2*)(sScale + (idx_in_warpgroup / 4) * 2);
+        CUTE_UNROLL
+        for (int lr = 0; lr < 2; ++lr) {
+          Tensor cur_rO2 = flatten(rO2(make_coord(_, lr, _), _, _));
+          Tensor cur_rOt = flatten(rOt(make_coord(_, lr, _), _, _));
+          Tensor cur_rOr = flatten(rOr(make_coord(_, lr, _), _, _));
+          CUTE_UNROLL
+          for (int i = 0; i < size(cur_rO2); ++i) cur_rO2(i) *= cur_scales[lr];
+          CUTE_UNROLL
+          for (int i = 0; i < size(cur_rOt); ++i) cur_rOt(i) *= cur_scales[lr];
+          CUTE_UNROLL
+          for (int i = 0; i < size(cur_rOr); ++i) cur_rOr(i) *= cur_scales[lr];
+        }
+
+        {
+          Tensor sS8_2 = make_tensor(
+              make_smem_ptr(plan.s8.data() + 2 * cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
+          Tensor sS8_3 = make_tensor(
+              make_smem_ptr(plan.s8.data() + 3 * cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
+          Tensor sB2 =
+              make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<256>{}, _0{})),
+                          typename Kt::SmemLayoutK8PVTiles<2>{});
+          Tensor sB3 =
+              make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<384>{}, _0{})),
+                          typename Kt::SmemLayoutK8PVTiles<1>{});
+          Tensor sRopeT = make_tensor(make_smem_ptr(plan.u.k[buf_idx].rope.data()),
+                                      typename Kt::SmemLayoutKRopeTransposed{});
+
+          gemm<false, -1>(tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_2),
+                          thr_PV128.partition_fragment_B(sB2), rO2);
+          gemm<false, -1>(tiled_mma_PV64, thr_PV64.partition_fragment_A(sS8_3),
+                          thr_PV64.partition_fragment_B(sB3), rOt);
+          gemm<false, -1>(tiled_mma_rope, thr_rope.partition_fragment_A(sS), thr_rope.partition_fragment_B(sRopeT),
+                          rOr);
+          cute::warpgroup_wait<0>();
+        }
+
+        plan.bar_k_avail[buf_idx].arrive();
+
+        if (block_idx != args.end_block_idx - 1)
+          NamedBarrier::arrive(256, Kt::NamedBarriers::sScale_and_sS_free);
+      }
+
+      NamedBarrier::arrive_and_wait(256, Kt::NamedBarriers::oBuf_free_and_sL_ready);
+
+      float o_scales[2];
+      CUTE_UNROLL
+      for (int i = 0; i < 2; ++i) {
+        int row = get_AorC_row_idx(i, idx_in_warpgroup);
+        o_scales[i] = plan.sOScale[row];
+      }
+
+      const int num_valid_seq_q = min(params.h_q, BLOCK_M);
+      {
+        int n_split_idx = batch_idx == sched_meta.begin_req_idx ? sched_meta.begin_split_idx : 0;
+        int split_idx = __ldg(params.num_splits_ptr + batch_idx) + n_split_idx;
+        float* oaccum_ptr = (float*)params.o_accum + split_idx * params.stride_o_accum_split +
+                            s_q_idx * params.stride_o_accum_s_q + 0 * params.stride_o_accum_h_q;
+
+        Tensor gO2 = make_tensor(
+            make_gmem_ptr(oaccum_ptr + 256),
+            make_layout(Shape<Int<BLOCK_M>, _128>{}, make_stride(params.stride_o_accum_h_q, _1{})));
+        Tensor gOt = make_tensor(
+            make_gmem_ptr(oaccum_ptr + 384),
+            make_layout(Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}, make_stride(params.stride_o_accum_h_q, _1{})));
+        Tensor gOr = make_tensor(
+            make_gmem_ptr(oaccum_ptr + 448),
+            make_layout(Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}, make_stride(params.stride_o_accum_h_q, _1{})));
+        Tensor tOg2 = thr_PV128.partition_C(gO2);
+        Tensor tOgt = thr_PV64.partition_C(gOt);
+        Tensor tOgr = thr_rope.partition_C(gOr);
+        CUTE_UNROLL
+        for (int lr = 0; lr < 2; ++lr) {
+          Tensor cg2 = flatten(tOg2(make_coord(_, lr, _), _, _));
+          Tensor cr2 = flatten(rO2(make_coord(_, lr, _), _, _));
+          Tensor cgt = flatten(tOgt(make_coord(_, lr, _), _, _));
+          Tensor crt = flatten(rOt(make_coord(_, lr, _), _, _));
+          Tensor cgr = flatten(tOgr(make_coord(_, lr, _), _, _));
+          Tensor crr = flatten(rOr(make_coord(_, lr, _), _, _));
+          CUTE_UNROLL
+          for (int i = 0; i < size(cr2); ++i) cg2(i) = cr2(i) * o_scales[lr];
+          CUTE_UNROLL
+          for (int i = 0; i < size(crt); ++i) cgt(i) = crt(i) * o_scales[lr];
+          CUTE_UNROLL
+          for (int i = 0; i < size(crr); ++i) cgr(i) = crr(i) * o_scales[lr];
+        }
+        (void)num_valid_seq_q;
+      }
+
+      plan.bar_o_done.arrive();
+      Kt::sync_all_threads_in_cluster();
+    }
+    return;
+  }
 }
 
 template <int NUM_HEADS, bool USE_FP8_MMA>
