@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 
@@ -334,20 +336,44 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
     return out, lse.transpose(1, 2)
 
 
+@triton.jit
+def _quantize_q_fp8_kernel(
+    q_ptr,
+    q8_ptr,
+    qrope_ptr,
+    shift_ptr,
+    n_rows,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    PAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, PAD_DIM)
+    mask = offs < NOPE_DIM
+    q = tl.load(q_ptr + row * (NOPE_DIM + ROPE_DIM) + offs, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(q), axis=0)
+    shift = tl.math.exp2(tl.math.floor(tl.math.log2(tl.maximum(amax, 1e-30) / 64.0) + 0.5))
+    tl.store(q8_ptr + row * NOPE_DIM + offs, (q / shift).to(tl.float8e4nv), mask=mask)
+    tl.store(shift_ptr + row, shift)
+    roffs = tl.arange(0, ROPE_DIM)
+    tl.store(qrope_ptr + row * ROPE_DIM + roffs, tl.load(q_ptr + row * (NOPE_DIM + ROPE_DIM) + NOPE_DIM + roffs))
+
+
 def _quantize_q_for_fp8_mma(q: torch.Tensor):
     """Split BF16 Q [b, s_q, h_q, 512] into E4M3 NoPE (with an exact
     power-of-two per-head shift folded back into the scores), BF16 RoPE,
-    and the shift tensor.  All three are contiguous for the kernel."""
-    q_nope = q[..., :448].float()
-    amax = q_nope.abs().amax(dim=-1, keepdim=True).clamp(min=1e-30)
-    shift = torch.pow(2.0, torch.round(torch.log2(amax / 64.0)))
-    q8 = (q_nope / shift).to(torch.float8_e4m3fn)
-    q_rope = q[..., 448:].contiguous()
-    return (
-        q8.contiguous(),
-        q_rope,
-        shift.squeeze(-1).contiguous(),
+    and the shift tensor, in one Triton pass (the eager-op chain costs
+    ~half a millisecond per layer at decode batch sizes)."""
+    q_c = q if q.is_contiguous() else q.contiguous()
+    b, s, h, d = q_c.shape
+    n = b * s * h
+    q8 = torch.empty((n, 448), dtype=torch.float8_e4m3fn, device=q.device)
+    q_rope = torch.empty((n, 64), dtype=torch.bfloat16, device=q.device)
+    shift = torch.empty((n,), dtype=torch.float32, device=q.device)
+    _quantize_q_fp8_kernel[(n,)](
+        q_c, q8, q_rope, shift, n, NOPE_DIM=448, ROPE_DIM=64, PAD_DIM=512, num_warps=1
     )
+    return q8.view(b, s, h, 448), q_rope.view(b, s, h, 64), shift.view(b, s, h)
 
 
 def flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma(
