@@ -94,6 +94,20 @@ class KernelTemplate {
   using SmemLayoutK8Tiles =
       decltype(tile_to_shape(SmemLayoutK8Tile{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
   using SmemLayoutK8 = SmemLayoutK8Tiles<HEAD_DIM_NOPE / 64>;
+  // PV-side orientation: (dim, token) with tokens K-major.  SW64 cannot be
+  // re-viewed between orientations (the swizzle is tied to the physical
+  // layout; see the transposed-V staging in sparse_mla_q8kv8_prefill_sm90),
+  // so the repacked payload is staged twice — once per contraction side.
+  using SmemLayoutK8PVTile = decltype(tile_to_shape(
+      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<64>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
+  template <int NUM_TILES>
+  using SmemLayoutK8PVTiles =
+      decltype(tile_to_shape(SmemLayoutK8PVTile{}, Shape<Int<64 * NUM_TILES>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
+  using SmemLayoutK8PV = SmemLayoutK8PVTiles<HEAD_DIM_NOPE / 64>;
+  // Per-block rescaled P (E4M3) as the PV A operand: (head, token), tokens
+  // K-major — four 64x64 tiles, one per 128-dim scale block.
+  using SmemLayoutS8 =
+      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
   using SmemLayoutQ8Tile =
       decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<64>>{}, Step<_1, _2>{}));
   template <int NUM_TILES>
@@ -122,13 +136,15 @@ class KernelTemplate {
     transac_bar_t bar_o_done;
   };
 
-  // FP8 K/V staging buffer: E2M1 payload as E4M3 (28 KB), the BF16 RoPE
-  // payload (8 KB), and the four per-token 128-dim block scales converted
-  // to float (the producer reads scale slots 0/4/8/12 of the 14-byte row).
-  // Token-major so one token's four scales are a contiguous float4.
+  // FP8 K/V staging buffer: the E2M1 payload repacked to E4M3 in BOTH
+  // orientations (SW64 swizzles cannot be re-viewed), the BF16 RoPE payload
+  // (INTER layout — the transposed PV view is a composition, no double
+  // staging needed), and the four per-token 128-dim block scales as floats
+  // (token-major so one token's scales are a contiguous float4).
   struct Fp8KBuf {
-    array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;
-    array_aligned<bf16, cosize_v<SmemLayoutKRope>> rope;
+    array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;      // (token, dim): QK B operand
+    array_aligned<Fp8T, cosize_v<SmemLayoutK8PV>> k8pv;  // (dim, token): PV B operand
+    array_aligned<bf16, cosize_v<SmemLayoutKRope>> rope;  // (token, dim)
     float block_scale[TOPK_BLOCK_SIZE][4];
   };
 
@@ -142,7 +158,8 @@ class KernelTemplate {
       array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
       array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
     } u;
-    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;   // BF16 P for the RoPE PV gemm
+    CUTE_ALIGNAS(1024) array_aligned<Fp8T, 4 * cosize_v<SmemLayoutS8>> s8;  // per-block E4M3 P
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
     float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];

@@ -85,15 +85,277 @@ __forceinline__ __device__ void scale_softmax(
   if (idx_in_warpgroup % 4 == 0) *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
 }
 
+// ---------------------------------------------------------------------------
+// FP8-MMA mainloop (Phase 2): E4M3-repacked NoPE payload with the E8M0 block
+// scales applied outside the WGMMA — on the FP32 QK partials per 128-dim
+// block (DeepGEMM's paged-MQA-logits pattern) and on P per block before PV
+// (exact power-of-two rescales, folded back through the row scale).  RoPE
+// stays BF16 end to end.  CLUSTER_SIZE == 1 (h_q = 64) only for now.
+// ---------------------------------------------------------------------------
+template <int NUM_HEADS, typename TMAParams>
+__device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const TMAParams& tma_params) {
+  static_assert(NUM_HEADS == 64, "FP8-MMA path initially covers the h_q=64 geometry");
+  constexpr int NUM_K_BUFS = 2;
+  constexpr int BLOCK_M = 64;
+  constexpr int TOPK_BLOCK_SIZE = 64;
+
+  const int s_q_idx = blockIdx.y;
+  const int partition_idx = blockIdx.z;
+  const int warpgroup_idx = cutlass::canonical_warp_group_idx();
+  const int idx_in_warpgroup = threadIdx.x % 128;
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+
+  extern __shared__ char wksp_buf[];
+  using Kt = KernelTemplate<NUM_HEADS, true>;
+  using Fp8T = typename Kt::Fp8T;
+  auto& plan = *reinterpret_cast<typename Kt::SharedMemoryPlan*>(wksp_buf);
+  Tensor sQ8 = make_tensor(make_smem_ptr(plan.q8.data()), typename Kt::SmemLayoutQ8{});
+  Tensor sQRope = make_tensor(make_smem_ptr(plan.q_rope.data()), typename Kt::SmemLayoutQRope{});
+  Tensor sS = make_tensor(make_smem_ptr(plan.s.data()), typename Kt::SmemLayoutS{});
+  float* sM = plan.sM;
+  float* sL = plan.sL;
+  float* sScale = plan.sScale;
+
+  if (warp_idx == 0 && elect_one_sync()) {
+    cute::prefetch_tma_descriptor(&tma_params.tensor_map_o);
+    plan.bar_q.init(1);
+    CUTE_UNROLL
+    for (int i = 0; i < NUM_K_BUFS; ++i) {
+      plan.bar_k_local_ready[i].init(128);
+      plan.bar_k_avail[i].init(256);
+    }
+    plan.bar_o_done.init(256);
+    cutlass::arch::fence_barrier_init();
+  }
+  ku::barrier_cluster_arrive_relaxed();
+
+  int bar_phase_k = 0;
+  int bar_phase_o = 0;
+
+  DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
+  if (sched_meta.begin_req_idx >= params.b) return;
+  ku::barrier_cluster_wait_acquire();
+
+  struct MainloopArgs {
+    int start_block_idx, end_block_idx;
+    bool is_no_split;
+    int topk_length, extra_topk_length, num_orig_kv_blocks;
+  };
+  auto get_cur_req_info = [&](int batch_idx) -> MainloopArgs {
+    MainloopArgs args;
+    int topk_length = params.topk_length ? __ldg(params.topk_length + batch_idx) : params.topk;
+    topk_length = max(0, min(topk_length, params.topk));
+    int orig_topk_padded = max(ku::ceil(topk_length, (int)TOPK_BLOCK_SIZE), (int)TOPK_BLOCK_SIZE);
+    int extra_topk_length = params.extra_topk_length ? __ldg(params.extra_topk_length + batch_idx) : params.extra_topk;
+    extra_topk_length = max(0, min(extra_topk_length, params.extra_topk));
+    int total_topk_padded = orig_topk_padded + ku::ceil(extra_topk_length, (int)TOPK_BLOCK_SIZE);
+    args.topk_length = topk_length;
+    args.extra_topk_length = extra_topk_length;
+    args.num_orig_kv_blocks = orig_topk_padded / TOPK_BLOCK_SIZE;
+    args.start_block_idx = batch_idx == sched_meta.begin_req_idx ? sched_meta.begin_block_idx : 0;
+    args.end_block_idx =
+        batch_idx == sched_meta.end_req_idx ? sched_meta.end_block_idx : total_topk_padded / TOPK_BLOCK_SIZE;
+    args.is_no_split = batch_idx == sched_meta.begin_req_idx
+                           ? !sched_meta.is_first_req_splitted
+                           : (batch_idx == sched_meta.end_req_idx ? !sched_meta.is_last_req_splitted : true);
+    return args;
+  };
+
+  // Q staging: all 384 threads copy the wrapper-quantized Q tiles in
+  // 16-byte granules through the cute layouts (16 E4M3 / 8 BF16 per granule).
+  constexpr int NUM_Q8_GRANULES = BLOCK_M * Kt::HEAD_DIM_NOPE / 16;
+  constexpr int NUM_QROPE_GRANULES = BLOCK_M * Kt::HEAD_DIM_ROPE / 8;
+  auto stage_q = [&](int batch_idx) {
+    const int tid = threadIdx.x;
+    const Fp8T* g_q8 = params.q_nope_fp8 + batch_idx * params.stride_q8_b + s_q_idx * params.stride_q8_s_q;
+    const bf16* g_qr = params.q_rope + batch_idx * params.stride_qrope_b + s_q_idx * params.stride_qrope_s_q;
+    CUTE_UNROLL
+    for (int g = tid; g < NUM_Q8_GRANULES; g += 384) {
+      const int head = g / (Kt::HEAD_DIM_NOPE / 16);
+      const int dim16 = (g % (Kt::HEAD_DIM_NOPE / 16)) * 16;
+      *reinterpret_cast<uint4*>(&sQ8(head, dim16)) =
+          *reinterpret_cast<const uint4*>(g_q8 + head * params.stride_q8_h_q + dim16);
+    }
+    CUTE_UNROLL
+    for (int g = tid; g < NUM_QROPE_GRANULES; g += 384) {
+      const int head = g / (Kt::HEAD_DIM_ROPE / 8);
+      const int dim8 = (g % (Kt::HEAD_DIM_ROPE / 8)) * 8;
+      *reinterpret_cast<uint4*>(&sQRope(head, dim8)) =
+          *reinterpret_cast<const uint4*>(g_qr + head * params.stride_qrope_h_q + dim8);
+    }
+    NamedBarrier::arrive_and_wait(384, 15 /* scratch id, unused by the FP8 path */);
+  };
+  stage_q(sched_meta.begin_req_idx);
+
+  if (warpgroup_idx == 2) {
+    // ------------------------------------------------------------------
+    // Producer: repack E2M1 -> E4M3 (lossless) into BOTH orientations, keep
+    // RoPE BF16, stage the four per-token block scales.  No scale multiplies
+    // here — consumers apply the E8M0 exponents outside the WGMMA.
+    // ------------------------------------------------------------------
+    cutlass::arch::warpgroup_reg_dealloc<152>();
+
+    const int producer_warp_idx = __shfl_sync(0xffffffff, idx_in_warpgroup / 32, 0);
+    const int lane_idx = idx_in_warpgroup % 32;
+    const int my_token_idx = producer_warp_idx * 8 + lane_idx % 8;
+
+    CUTE_NO_UNROLL
+    for (int batch_idx = sched_meta.begin_req_idx; batch_idx <= sched_meta.end_req_idx; ++batch_idx) {
+      MainloopArgs args = get_cur_req_info(batch_idx);
+      if (batch_idx != sched_meta.begin_req_idx) {
+        plan.bar_o_done.wait(bar_phase_o);
+        bar_phase_o ^= 1;
+      }
+
+      int* gIndices = params.indices + batch_idx * params.stride_indices_b + s_q_idx * params.stride_indices_s_q;
+      int* gExtraIndices = params.extra_indices == nullptr
+                               ? nullptr
+                               : params.extra_indices + batch_idx * params.stride_extra_indices_b +
+                                     s_q_idx * params.stride_extra_indices_s_q;
+
+      struct IsOrigBlock {};
+      struct IsExtraBlock {};
+      auto process_one_block = [&](int block_idx, auto is_extra_block_t) {
+        static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
+        const int buf_idx = (block_idx - args.start_block_idx) % NUM_K_BUFS;
+        const int rel_block_idx = IS_EXTRA_BLOCK ? block_idx - args.num_orig_kv_blocks : block_idx;
+        int* const indices_base = (IS_EXTRA_BLOCK ? gExtraIndices : gIndices) + rel_block_idx * TOPK_BLOCK_SIZE;
+        const int page_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
+        const int num_blocks = IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks;
+        const int topk_length = IS_EXTRA_BLOCK ? args.extra_topk_length : args.topk_length;
+        const int64_t k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
+        const int64_t k_row_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_row : params.stride_kv_row;
+        const uint8_t* const k_ptr = reinterpret_cast<const uint8_t*>(IS_EXTRA_BLOCK ? params.extra_kv : params.kv);
+        const int64_t token_capacity = static_cast<int64_t>(num_blocks) * page_block_size;
+
+        Tensor sK8buf = make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8.data()), typename Kt::SmemLayoutK8{});
+        Tensor sK8PVbuf = make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8pv.data()), typename Kt::SmemLayoutK8PV{});
+        Tensor sKRopeBuf = make_tensor(make_smem_ptr(plan.u.k[buf_idx].rope.data()), typename Kt::SmemLayoutKRope{});
+        const mxfp4::E2m1E4m3Lut repack_lut = mxfp4::make_e2m1_e4m3_lut();
+
+        CUTE_UNROLL
+        for (int round = 0; round < 2; ++round) {
+          const int my_token = my_token_idx + round * 32;
+          const int selected_pos = rel_block_idx * TOPK_BLOCK_SIZE + my_token;
+          const int token_index = selected_pos < topk_length ? __ldg(indices_base + my_token) : -1;
+          const bool token_is_valid = token_index >= 0 && static_cast<int64_t>(token_index) < token_capacity;
+          const uint8_t* gK_base = nullptr;
+          if (token_is_valid) {
+            const int block_index =
+                static_cast<int>(static_cast<uint32_t>(token_index) / static_cast<uint32_t>(page_block_size));
+            const int rel_idx_in_block =
+                static_cast<int>(static_cast<uint32_t>(token_index) % static_cast<uint32_t>(page_block_size));
+            gK_base = k_ptr + block_index * k_block_stride + rel_idx_in_block * k_row_stride;
+          }
+
+          if (round == 0) {
+            plan.bar_k_avail[buf_idx].wait((bar_phase_k >> buf_idx & 1) ^ 1);
+          }
+
+          CUTE_UNROLL
+          for (int dim_idx = 0; dim_idx < Kt::HEAD_DIM_NOPE / 64; ++dim_idx) {
+            const int logical_dim = dim_idx * 64 + (lane_idx / 8) * 16;
+            uint64_t packed = 0;
+            if (token_is_valid) {
+              packed = nvfp4::load_packed_e2m1x16(gK_base + logical_dim / 2);
+            }
+            const uint2 lo = mxfp4::repack_e2m1x8_e4m3x8((uint32_t)packed, repack_lut);
+            const uint2 hi = mxfp4::repack_e2m1x8_e4m3x8((uint32_t)(packed >> 32), repack_lut);
+            const uint4 bytes = {lo.x, lo.y, hi.x, hi.y};
+            // QK orientation: one 16-byte granule at (token, dim).
+            *reinterpret_cast<uint4*>(&sK8buf(my_token, logical_dim)) = bytes;
+            // PV orientation: scattered per-byte writes at (dim, token).
+            const Fp8T* vals = reinterpret_cast<const Fp8T*>(&bytes);
+            CUTE_UNROLL
+            for (int j = 0; j < 16; ++j) {
+              sK8PVbuf(logical_dim + j, my_token) = vals[j];
+            }
+          }
+
+          CUTE_UNROLL
+          for (int dim_idx = 0; dim_idx < Kt::HEAD_DIM_ROPE / 32; ++dim_idx) {
+            const int rope_dim = dim_idx * 32 + (lane_idx / 8) * 8;
+            bf16x8 rope = {};
+            if (token_is_valid) {
+              rope = load_bf16x8(
+                  gK_base + Kt::PACKED_NOPE_BYTES + Kt::NUM_SCALES + Kt::PAD_BYTES + rope_dim * sizeof(bf16));
+            }
+            *reinterpret_cast<__int128_t*>(&sKRopeBuf(my_token, rope_dim)) =
+                *reinterpret_cast<const __int128_t*>(&rope);
+          }
+        }
+
+        // Per-token block scales (slots 0/4/8/12 = byte 0 of each u32 of
+        // the scale area's first 16 bytes), staged as floats.
+        if ((lane_idx / 8) == 0) {
+          CUTE_UNROLL
+          for (int round = 0; round < 2; ++round) {
+            const int my_token = my_token_idx + round * 32;
+            const int selected_pos = rel_block_idx * TOPK_BLOCK_SIZE + my_token;
+            const int token_index = selected_pos < topk_length ? __ldg(indices_base + my_token) : -1;
+            const bool token_is_valid =
+                token_index >= 0 && static_cast<int64_t>(token_index) < token_capacity;
+            const uint8_t* gK_base = token_is_valid
+                                         ? k_ptr + (token_index / page_block_size) * k_block_stride +
+                                               (token_index % page_block_size) * k_row_stride
+                                         : nullptr;
+            uint4 words = {};
+            if (token_is_valid) {
+              asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
+                           : "=r"(words.x), "=r"(words.y), "=r"(words.z), "=r"(words.w)
+                           : "l"(gK_base + Kt::PACKED_NOPE_BYTES));
+            }
+            float4 scales = {mxfp4::e8m0_bits_to_float((uint8_t)(words.x & 0xff)),
+                             mxfp4::e8m0_bits_to_float((uint8_t)(words.y & 0xff)),
+                             mxfp4::e8m0_bits_to_float((uint8_t)(words.z & 0xff)),
+                             mxfp4::e8m0_bits_to_float((uint8_t)(words.w & 0xff))};
+            *reinterpret_cast<float4*>(&plan.u.k[buf_idx].block_scale[my_token][0]) = scales;
+          }
+        }
+
+        fence_view_async_shared();
+
+        if (idx_in_warpgroup < 32) {
+          const int pos0 = rel_block_idx * TOPK_BLOCK_SIZE + lane_idx * 2;
+          const int pos1 = pos0 + 1;
+          const int selected0 = pos0 < topk_length ? __ldg(indices_base + lane_idx * 2) : -1;
+          const int selected1 = pos1 < topk_length ? __ldg(indices_base + lane_idx * 2 + 1) : -1;
+          *reinterpret_cast<char2*>(&plan.is_kv_valid[buf_idx][lane_idx * 2]) = {
+              selected0 >= 0 && static_cast<int64_t>(selected0) < token_capacity,
+              selected1 >= 0 && static_cast<int64_t>(selected1) < token_capacity,
+          };
+        }
+
+        plan.bar_k_local_ready[buf_idx].arrive();
+        bar_phase_k ^= 1 << buf_idx;
+      };
+
+      CUTE_NO_UNROLL
+      for (int block_idx = args.start_block_idx;
+           block_idx < min(args.num_orig_kv_blocks, args.end_block_idx); ++block_idx) {
+        process_one_block(block_idx, IsOrigBlock{});
+      }
+      CUTE_NO_UNROLL
+      for (int block_idx = max(args.start_block_idx, args.num_orig_kv_blocks); block_idx < args.end_block_idx;
+           ++block_idx) {
+        process_one_block(block_idx, IsExtraBlock{});
+      }
+
+      Kt::sync_all_threads_in_cluster();
+    }
+    return;
+  }
+
+  // Consumers land in the next slice; fail loudly if reached meanwhile.
+  if (cute::thread0()) CUTE_INVALID_CONTROL_PATH("FP8-MMA consumer warpgroups not yet wired");
+}
+
 template <int NUM_HEADS, bool USE_FP8_MMA>
 template <typename TMAParams>
 __device__ void KernelTemplate<NUM_HEADS, USE_FP8_MMA>::devfunc(const SparseAttnDecodeParams& params, const TMAParams& tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
   if constexpr (USE_FP8_MMA) {
-    // The FP8-MMA mainloop (block-decomposed E8M0 scales over E4M3-repacked
-    // K, per-block rescaled P) lands in a later change; the variant is
-    // instantiated for compile coverage until then.
-    if (cute::thread0()) CUTE_INVALID_CONTROL_PATH("FP8-MMA decode mainloop not yet wired");
+    devfunc_fp8_mainloop<NUM_HEADS>(params, tma_params);
     return;
   } else {
   const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
