@@ -11,6 +11,7 @@
 #include "flashmla_utils.h"
 #include "kerutils/kerutils.cuh"
 #include "splitkv_mla.h"
+#include <cuda_fp8.h>
 #include <math_constants.h>
 using namespace cute;
 
@@ -526,13 +527,15 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             k_row[lr] = mx > 0.f ? (6.f - log2f(mx)) : 0.f;  // headroom for x2^{s_b}
             rK[lr] = k_row[lr];
           }
+          float kpow[2] = {exp2f(k_row[0]), exp2f(k_row[1])};
           CUTE_UNROLL
           for (int lr = 0; lr < 2; ++lr) {
             Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
             Tensor cur_rS = flatten(rS(make_coord(_, lr, _), _, _));
+            const float kp = kpow[lr];
             CUTE_UNROLL
             for (int i = 0; i < size(cur_rP); ++i) {
-              cur_rS(i) = (bf16)(cur_rP(i) * exp2f(k_row[lr]));
+              cur_rS(i) = (bf16)(cur_rP(i) * kp);
             }
           }
           CUTE_UNROLL
@@ -544,11 +547,17 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             for (int lr = 0; lr < 2; ++lr) {
               Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
               const int row = get_AorC_row_idx(lr, idx_in_warpgroup);
+              const float kp = kpow[lr];
+              const int base_tok = (idx_in_warpgroup % 4) * 2;
+              // Adjacent fragment elements map to adjacent tokens: pairs
+              // convert with one cvt and store with one 16-bit write.
               CUTE_UNROLL
-              for (int i = 0; i < size(cur_rP); ++i) {
-                const int tok = (i & 1) + (i / 2) * 8 + (idx_in_warpgroup % 4) * 2;
-                const float v = cur_rP(i) * exp2f(k_row[lr]) * bscale[tok * 4 + b];
-                sS8b(row, tok) = Fp8T(v);
+              for (int i = 0; i < size(cur_rP); i += 2) {
+                const int tok = (i >> 1) * 8 + base_tok;
+                const float2 pair = {cur_rP(i) * kp * bscale[tok * 4 + b],
+                                     cur_rP(i + 1) * kp * bscale[(tok + 1) * 4 + b]};
+                const uint16_t packed = (uint16_t)__nv_cvt_float2_to_fp8x2(pair, __NV_SATFINITE, __NV_E4M3);
+                *reinterpret_cast<uint16_t*>(&sS8b(row, tok)) = packed;
               }
             }
           }
