@@ -98,16 +98,16 @@ class KernelTemplate {
   // re-viewed between orientations (the swizzle is tied to the physical
   // layout; see the transposed-V staging in sparse_mla_q8kv8_prefill_sm90),
   // so the repacked payload is staged twice — once per contraction side.
-  using SmemLayoutK8PVTile = decltype(tile_to_shape(
-      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<64>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
+  using SmemLayoutK8PVTile =
+      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<64>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
   template <int NUM_TILES>
   using SmemLayoutK8PVTiles =
       decltype(tile_to_shape(SmemLayoutK8PVTile{}, Shape<Int<64 * NUM_TILES>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
   using SmemLayoutK8PV = SmemLayoutK8PVTiles<HEAD_DIM_NOPE / 64>;
   // Per-block rescaled P (E4M3) as the PV A operand: (head, token), tokens
   // K-major — four 64x64 tiles, one per 128-dim scale block.
-  using SmemLayoutS8 =
-      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
+  using SmemLayoutS8 = decltype(tile_to_shape(
+      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}, Step<_1, _2>{}));
   using SmemLayoutQ8Tile =
       decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<64>>{}, Step<_1, _2>{}));
   template <int NUM_TILES>
@@ -115,6 +115,11 @@ class KernelTemplate {
       decltype(tile_to_shape(SmemLayoutQ8Tile{}, Shape<Int<BLOCK_M>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
   using SmemLayoutQ8 = SmemLayoutQ8Tiles<HEAD_DIM_NOPE / 64>;
   using SmemLayoutKRope = SmemLayoutKTiles<HEAD_DIM_ROPE / 64>;
+  // (dim, token) view of the RoPE tile for the RoPE PV gemm — INTER tiles
+  // carry no swizzle, so the transposed view is a pure composition.
+  using SmemLayoutKRopeTransposed = decltype(composition(
+      SmemLayoutKRope{},
+      Layout<Shape<Int<HEAD_DIM_ROPE>, Int<TOPK_BLOCK_SIZE>>, Stride<Int<TOPK_BLOCK_SIZE>, _1>>{}));
   using SmemLayoutQRope = SmemLayoutQTiles<HEAD_DIM_ROPE / 64>;
 
   struct SharedMemoryPlanBf16 {
@@ -142,8 +147,8 @@ class KernelTemplate {
   // staging needed), and the four per-token 128-dim block scales as floats
   // (token-major so one token's scales are a contiguous float4).
   struct Fp8KBuf {
-    array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;      // (token, dim): QK B operand
-    array_aligned<Fp8T, cosize_v<SmemLayoutK8PV>> k8pv;  // (dim, token): PV B operand
+    array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;       // (token, dim): QK B operand
+    array_aligned<Fp8T, cosize_v<SmemLayoutK8PV>> k8pv;   // (dim, token): PV B operand
     array_aligned<bf16, cosize_v<SmemLayoutKRope>> rope;  // (token, dim)
     float block_scale[TOPK_BLOCK_SIZE][4];
   };
@@ -158,11 +163,11 @@ class KernelTemplate {
       array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
       array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
     } u;
-    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;   // BF16 P for the RoPE PV gemm
+    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;        // BF16 P for the RoPE PV gemm
     CUTE_ALIGNAS(1024) array_aligned<Fp8T, 4 * cosize_v<SmemLayoutS8>> s8;  // per-block E4M3 P
     bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
 
-    float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
+    float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M], sKrow[BLOCK_M];
     transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
     transac_bar_t bar_o_done;
   };
@@ -197,6 +202,10 @@ class KernelTemplate {
   // availability is pinned by compilation.
   using TiledMMA_QK_Fp8 =
       decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  // PV per 128-dim scale block (the per-block P rescale forbids one wide
+  // N=256 gemm); the 64-wide tail block reuses the QK atom shape.
+  using TiledMMA_PV128_Fp8 =
+      decltype(make_tiled_mma(GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
   using TiledMMA_PV_LocalP_Fp8 =
       decltype(make_tiled_mma(GMMA::MMA_64x256x32_F32E4M3E4M3_RS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
   using TiledMMA_PV_RemoteP_Fp8 =
