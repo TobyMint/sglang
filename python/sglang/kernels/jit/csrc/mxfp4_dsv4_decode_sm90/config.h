@@ -118,6 +118,20 @@ class KernelTemplate {
   using TiledMMA_PV_RemoteP = decltype(make_tiled_mma(
       GMMA::MMA_64x256x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::MN>{}, Layout<Shape<_1, _1, _1>>{}));
 
+  // FP8-MMA twins (Phase 2, block-decomposed-scale path): the K tile is
+  // repacked E2M1→E4M3 (lossless, see dequant.h) and the E8M0 scales are
+  // applied outside the WGMMA — on the FP32 QK partials per 128-dim block,
+  // and on P per block before PV.  FP8 atoms double the K depth to 32 and
+  // come as fixed-orientation _TN variants (A K-major, ScaleIn defaults).
+  // Unused until the mainloop fork lands; declared here so the atom/layout
+  // availability is pinned by compilation.
+  using TiledMMA_QK_Fp8 = decltype(make_tiled_mma(
+      GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  using TiledMMA_PV_LocalP_Fp8 = decltype(make_tiled_mma(
+      GMMA::MMA_64x256x32_F32E4M3E4M3_RS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+  using TiledMMA_PV_RemoteP_Fp8 = decltype(make_tiled_mma(
+      GMMA::MMA_64x256x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+
   enum NamedBarriers : uint32_t {
     sScale_and_sS_ready = 0,
     sScale_and_sS_free = 1,

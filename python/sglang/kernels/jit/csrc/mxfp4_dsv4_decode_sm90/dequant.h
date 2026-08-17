@@ -123,4 +123,36 @@ __device__ __forceinline__ float e8m0_bits_to_float(uint8_t bits) {
   return __int_as_float(static_cast<uint32_t>(bits) << 23);
 }
 
+// E4M3 bit patterns of the eight positive E2M1 magnitudes
+// {0, .5, 1, 1.5, 2, 3, 4, 6}: every E2M1 value is exactly representable in
+// E4M3, so a nibble LUT repacks the payload losslessly.  FP8-MMA paths that
+// apply the E8M0 scales outside the WGMMA (block-decomposed QK / per-block
+// rescaled P) consume this representation instead of the scaled-BF16 one.
+struct E2m1E4m3Lut {
+  uint32_t lo;  // bytes 0-3: magnitudes {0, .5, 1, 1.5}
+  uint32_t hi;  // bytes 4-7: magnitudes {2, 3, 4, 6}
+};
+
+__device__ __forceinline__ E2m1E4m3Lut make_e2m1_e4m3_lut() {
+  return {0x3C383000u, 0x4C484440u};
+}
+
+// Move the E2M1 sign bits of the four nibbles in the low 16 bits to the E4M3
+// sign positions of the four output bytes.
+__device__ __forceinline__ uint32_t e4m3_signs_0_3(uint32_t packed) {
+  return ((packed & 0x00000008u) << 4) | ((packed & 0x00000080u) << 8) |
+         ((packed & 0x00000800u) << 12) | ((packed & 0x00008000u) << 16);
+}
+
+// Repack the eight E2M1 codes of a packed u32 into eight E4M3 bytes (element
+// order preserved).  The masked nibbles double as PRMT selectors, mirroring
+// dequant_e2m1x8 above.
+__device__ __forceinline__ uint2 repack_e2m1x8_e4m3x8(uint32_t packed, const E2m1E4m3Lut& lut) {
+  const uint32_t lo =
+      __byte_perm(lut.lo, lut.hi, packed & 0x00007777u) | e4m3_signs_0_3(packed);
+  const uint32_t hi = __byte_perm(lut.lo, lut.hi, (packed >> 16) & 0x00007777u) |
+                      e4m3_signs_0_3(packed >> 16);
+  return {lo, hi};
+}
+
 }  // namespace sm90::mxfp4
