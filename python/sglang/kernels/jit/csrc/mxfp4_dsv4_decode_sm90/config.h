@@ -12,7 +12,7 @@ using namespace cute;
 
 namespace sm90::decode::sparse_mxfp4_dsv4 {
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool USE_FP8_MMA = false>
 class KernelTemplate {
  public:
   static_assert(NUM_HEADS == 64 || NUM_HEADS == 128);
@@ -80,7 +80,30 @@ class KernelTemplate {
   using SmemLayoutS =
       decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<bf16>{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
 
-  struct SharedMemoryPlan {
+  // ---- FP8-MMA path layouts (Phase 2, USE_FP8_MMA) ----
+  // The NoPE payload is repacked losslessly to E4M3 (dequant.h) and the
+  // E8M0 scales are applied outside the WGMMA; RoPE stays BF16.  Layout
+  // atoms follow the in-repo sparse_mla_q8kv8_prefill_sm90 kernel
+  // (Layout_K_SW64_Atom<fp8> tiled in 64-dim columns).  Blocks for the
+  // decomposed QK/PV are pairs of 64-dim tiles (dims 0-127 / 128-255 /
+  // 256-383) plus the single tail tile (384-447).
+  using Fp8T = cutlass::float_e4m3_t;
+  using SmemLayoutK8Tile = decltype(tile_to_shape(
+      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64>>{}, Step<_1, _2>{}));
+  template <int NUM_TILES>
+  using SmemLayoutK8Tiles = decltype(tile_to_shape(
+      SmemLayoutK8Tile{}, Shape<Int<TOPK_BLOCK_SIZE>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
+  using SmemLayoutK8 = SmemLayoutK8Tiles<HEAD_DIM_NOPE / 64>;
+  using SmemLayoutQ8Tile = decltype(tile_to_shape(
+      GMMA::Layout_K_SW64_Atom<Fp8T>{}, Shape<Int<BLOCK_M>, Int<64>>{}, Step<_1, _2>{}));
+  template <int NUM_TILES>
+  using SmemLayoutQ8Tiles =
+      decltype(tile_to_shape(SmemLayoutQ8Tile{}, Shape<Int<BLOCK_M>, Int<64 * NUM_TILES>>{}, Step<_1, _2>{}));
+  using SmemLayoutQ8 = SmemLayoutQ8Tiles<HEAD_DIM_NOPE / 64>;
+  using SmemLayoutKRope = SmemLayoutKTiles<HEAD_DIM_ROPE / 64>;
+  using SmemLayoutQRope = SmemLayoutQTiles<HEAD_DIM_ROPE / 64>;
+
+  struct SharedMemoryPlanBf16 {
     array_aligned<bf16, cosize_v<SmemLayoutQ>> q;
     union {
       array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_K_BUFS];
@@ -98,6 +121,35 @@ class KernelTemplate {
     // epilogue in flight.
     transac_bar_t bar_o_done;
   };
+
+  // FP8 K/V staging buffer: E2M1 payload as E4M3 (28 KB), the BF16 RoPE
+  // payload (8 KB), and the four per-token 128-dim block scales converted
+  // to float (the producer reads scale slots 0/4/8/12 of the 14-byte row).
+  struct Fp8KBuf {
+    array_aligned<Fp8T, cosize_v<SmemLayoutK8>> k8;
+    array_aligned<bf16, cosize_v<SmemLayoutKRope>> rope;
+    float block_scale[4][TOPK_BLOCK_SIZE];
+  };
+
+  struct SharedMemoryPlanFp8 {
+    // Q arrives pre-quantized from the wrapper: NoPE as E4M3 with per-head
+    // power-of-two shifts (folded into the softmax scale), RoPE as BF16.
+    array_aligned<Fp8T, cosize_v<SmemLayoutQ8>> q8;
+    array_aligned<bf16, cosize_v<SmemLayoutQRope>> q_rope;
+    union {
+      Fp8KBuf k[NUM_K_BUFS];
+      array_aligned<bf16, cosize_v<SmemLayoutOBuf>> oBuf;
+      array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> oAccumBuf;
+    } u;
+    CUTE_ALIGNAS(1024) array_aligned<bf16, cosize_v<SmemLayoutS>> s;
+    bool is_kv_valid[NUM_K_BUFS][TOPK_BLOCK_SIZE];
+
+    float sM[BLOCK_M], sL[BLOCK_M], sScale[BLOCK_M], sOScale[BLOCK_M];
+    transac_bar_t bar_q, bar_k_local_ready[NUM_K_BUFS], bar_k_remote_ready[NUM_K_BUFS], bar_k_avail[NUM_K_BUFS];
+    transac_bar_t bar_o_done;
+  };
+
+  using SharedMemoryPlan = std::conditional_t<USE_FP8_MMA, SharedMemoryPlanFp8, SharedMemoryPlanBf16>;
 
   template <typename Shape_Q, typename TMA_Q>
   struct TmaParams {

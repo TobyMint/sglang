@@ -18,4 +18,10 @@ void run_get_dsv4_mxfp4_decoding_sched_meta_kernel(const GetDecodeSchedMetaParam
 template <int NUM_HEADS>
 void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params);
 
+// Phase-2 variant: E4M3-repacked K with block-decomposed E8M0 scales (FP8
+// WGMMA). Instantiated for compile coverage while the mainloop lands; the
+// entry point is not yet exported to the wrapper.
+template <int NUM_HEADS>
+void run_flash_splitkv_mla_mxfp4_dsv4_sparse_fp8_mma_kernel_impl(const SparseAttnDecodeParams& params);
+
 }  // namespace sm90::decode::sparse_mxfp4_dsv4

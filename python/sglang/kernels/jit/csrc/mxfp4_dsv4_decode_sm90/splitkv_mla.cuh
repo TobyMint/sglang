@@ -85,10 +85,17 @@ __forceinline__ __device__ void scale_softmax(
   if (idx_in_warpgroup % 4 == 0) *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
 }
 
-template <int NUM_HEADS>
+template <int NUM_HEADS, bool USE_FP8_MMA>
 template <typename TMAParams>
-__device__ void KernelTemplate<NUM_HEADS>::devfunc(const SparseAttnDecodeParams& params, const TMAParams& tma_params) {
+__device__ void KernelTemplate<NUM_HEADS, USE_FP8_MMA>::devfunc(const SparseAttnDecodeParams& params, const TMAParams& tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+  if constexpr (USE_FP8_MMA) {
+    // The FP8-MMA mainloop (block-decomposed E8M0 scales over E4M3-repacked
+    // K, per-block rescaled P) lands in a later change; the variant is
+    // instantiated for compile coverage until then.
+    if (cute::thread0()) CUTE_INVALID_CONTROL_PATH("FP8-MMA decode mainloop not yet wired");
+    return;
+  } else {
   const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
   const int s_q_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -687,6 +694,7 @@ __device__ void KernelTemplate<NUM_HEADS>::devfunc(const SparseAttnDecodeParams&
       sync_all_threads_in_cluster();
     }
   }
+  }  // !USE_FP8_MMA
 #else
   if (cute::thread0()) {
     CUTE_INVALID_CONTROL_PATH("This kernel only supports sm90");
@@ -701,8 +709,8 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
   Kernel::devfunc(params, tma_params);
 }
 
-template <int NUM_HEADS>
-void KernelTemplate<NUM_HEADS>::run(const SparseAttnDecodeParams& params) {
+template <int NUM_HEADS, bool USE_FP8_MMA>
+void KernelTemplate<NUM_HEADS, USE_FP8_MMA>::run(const SparseAttnDecodeParams& params) {
   KU_ASSERT(params.h_kv == 1);
   KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
   KU_ASSERT(params.extra_topk % TOPK_BLOCK_SIZE == 0);
@@ -768,7 +776,7 @@ void KernelTemplate<NUM_HEADS>::run(const SparseAttnDecodeParams& params) {
 
   TmaParams<decltype(shape_Q), decltype(tma_Q)> tma_params = {shape_Q, tma_Q, tensor_map_o};
   auto mla_kernel =
-      &flash_fwd_splitkv_mla_mxfp4_dsv4_scaled_sparse_kernel<KernelTemplate<NUM_HEADS>, decltype(tma_params)>;
+      &flash_fwd_splitkv_mla_mxfp4_dsv4_scaled_sparse_kernel<KernelTemplate<NUM_HEADS, USE_FP8_MMA>, decltype(tma_params)>;
 
   constexpr size_t smem_size = sizeof(SharedMemoryPlan);
   KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -799,6 +807,11 @@ void KernelTemplate<NUM_HEADS>::run(const SparseAttnDecodeParams& params) {
 template <int NUM_HEADS>
 void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl(const SparseAttnDecodeParams& params) {
   KernelTemplate<NUM_HEADS>::run(params);
+}
+
+template <int NUM_HEADS>
+void run_flash_splitkv_mla_mxfp4_dsv4_sparse_fp8_mma_kernel_impl(const SparseAttnDecodeParams& params) {
+  KernelTemplate<NUM_HEADS, true>::run(params);
 }
 
 }  // namespace sm90::decode::sparse_mxfp4_dsv4

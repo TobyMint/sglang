@@ -38,6 +38,11 @@ constexpr int kFixedOverheadNumBlocks = 5;
 template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<64>(const SparseAttnDecodeParams& params);
 template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_kernel_impl<128>(const SparseAttnDecodeParams& params);
 
+// Phase-2 FP8-MMA variants: explicit instantiation pins the E4M3 layouts and
+// atoms in every build until the mainloop lands and the wrapper exports them.
+template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_fp8_mma_kernel_impl<64>(const SparseAttnDecodeParams& params);
+template void run_flash_splitkv_mla_mxfp4_dsv4_sparse_fp8_mma_kernel_impl<128>(const SparseAttnDecodeParams& params);
+
 namespace {
 
 __device__ __forceinline__ int clamp_length(const int* lengths, int request_idx, int width) {
