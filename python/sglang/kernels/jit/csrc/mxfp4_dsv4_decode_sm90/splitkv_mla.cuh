@@ -194,7 +194,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
     // RoPE BF16, stage the four per-token block scales.  No scale multiplies
     // here — consumers apply the E8M0 exponents outside the WGMMA.
     // ------------------------------------------------------------------
-    cutlass::arch::warpgroup_reg_dealloc<152>();
+    cutlass::arch::warpgroup_reg_dealloc<136>();
 
     const int producer_warp_idx = __shfl_sync(0xffffffff, idx_in_warpgroup / 32, 0);
     const int lane_idx = idx_in_warpgroup % 32;
@@ -359,7 +359,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
   (void)qk_tiles;
 
   if (warpgroup_idx == 0) {
-    cutlass::arch::warpgroup_reg_alloc<192>();
+    cutlass::arch::warpgroup_reg_alloc<232>();
 
     auto tiled_mma_QK8 = typename Kt::TiledMMA_QK_Fp8{};
     auto thr_QK8 = tiled_mma_QK8.get_slice(idx_in_warpgroup);
@@ -371,8 +371,8 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
     float rL[2], rM[2], rK[2];
     Tensor rP = partition_fragment_C(tiled_mma_QK8, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
     Tensor acc = partition_fragment_C(tiled_mma_QK8, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{});
-    Tensor rS =
-        make_tensor<bf16>(partition_shape_A(typename Kt::TiledMMA_PV_LocalP{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
+    Tensor rS = make_tensor<bf16>(
+        partition_shape_A(typename Kt::TiledMMA_PV_LocalP{}, Shape<Int<BLOCK_M>, Int<TOPK_BLOCK_SIZE>>{}));
     Tensor rO0 = partition_fragment_C(tiled_mma_PV128, Shape<Int<BLOCK_M>, _128>{});
     Tensor rO1 = partition_fragment_C(tiled_mma_PV128, Shape<Int<BLOCK_M>, _128>{});
 
@@ -397,8 +397,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
 
       float rShift[2] = {1.0f, 1.0f};
       {
-        const float* g_shift =
-            params.q_shift + batch_idx * params.stride_qshift_b + s_q_idx * params.stride_qshift_s_q;
+        const float* g_shift = params.q_shift + batch_idx * params.stride_qshift_b + s_q_idx * params.stride_qshift_s_q;
         for (int i = 0; i < 2; ++i) {
           rShift[i] = __ldg(g_shift + get_AorC_row_idx(i, idx_in_warpgroup));
         }
@@ -419,17 +418,11 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
         // accumulated fresh and folded into rP with its 128-dim block scale
         // (times the per-head Q shift).
         cute::clear(rP);
-#pragma unroll
-        for (int t = 0; t < Kt::HEAD_DIM_NOPE / 64; ++t) {
-          Tensor sQt = make_tensor(
-              make_smem_ptr(plan.q8.data() + (typename Kt::SmemLayoutQ8{})(_0{}, Int<64>{} * t)),
-              typename Kt::SmemLayoutQ8Tiles<1>{});
-          Tensor sKt = make_tensor(
-              make_smem_ptr(plan.u.k[buf_idx].k8.data() + (typename Kt::SmemLayoutK8{})(_0{}, Int<64>{} * t)),
-              typename Kt::SmemLayoutK8Tiles<1>{});
-          gemm<true, -1>(tiled_mma_QK8, thr_QK8.partition_fragment_A(sQt), thr_QK8.partition_fragment_B(sKt), acc);
-          cute::warpgroup_wait<0>();
-          const int blk = t >> 1;
+        // QK runs one gemm per 128-dim scale block (four WGMMA-k steps for
+        // blocks 0-2, two for the 64-dim tail): each block's fresh
+        // accumulator is folded into rP with its block scale, so the
+        // pipeline drains once per block instead of once per tile.
+        auto fold_block = [&](int blk) {
           CUTE_UNROLL
           for (int lr = 0; lr < 2; ++lr) {
             Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
@@ -440,13 +433,36 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
               cur_rP(i) += cur_acc(i) * (bscale[tok * 4 + blk] * rShift[lr]);
             }
           }
+        };
+#pragma unroll
+        for (int blk = 0; blk < 3; ++blk) {
+          Tensor sQb = make_tensor(
+              make_smem_ptr(plan.q8.data() + (typename Kt::SmemLayoutQ8{})(_0{}, Int<128>{} * blk)),
+              typename Kt::SmemLayoutQ8Tiles<2>{});
+          Tensor sKb = make_tensor(
+              make_smem_ptr(plan.u.k[buf_idx].k8.data() + (typename Kt::SmemLayoutK8{})(_0{}, Int<128>{} * blk)),
+              typename Kt::SmemLayoutK8Tiles<2>{});
+          gemm<true, -1>(tiled_mma_QK8, thr_QK8.partition_fragment_A(sQb), thr_QK8.partition_fragment_B(sKb), acc);
+          cute::warpgroup_wait<0>();
+          fold_block(blk);
+        }
+        {
+          Tensor sQb = make_tensor(
+              make_smem_ptr(plan.q8.data() + (typename Kt::SmemLayoutQ8{})(_0{}, Int<384>{})),
+              typename Kt::SmemLayoutQ8Tiles<1>{});
+          Tensor sKb = make_tensor(
+              make_smem_ptr(plan.u.k[buf_idx].k8.data() + (typename Kt::SmemLayoutK8{})(_0{}, Int<384>{})),
+              typename Kt::SmemLayoutK8Tiles<1>{});
+          gemm<true, -1>(tiled_mma_QK8, thr_QK8.partition_fragment_A(sQb), thr_QK8.partition_fragment_B(sKb), acc);
+          cute::warpgroup_wait<0>();
+          fold_block(3);
         }
         // RoPE QK (BF16) accumulates directly into rP.
         {
           Tensor sKRopeT = make_tensor(make_smem_ptr(plan.u.k[buf_idx].rope.data()), typename Kt::SmemLayoutKRope{});
           Tensor sQR = make_tensor(make_smem_ptr(plan.q_rope.data()), typename Kt::SmemLayoutQRope{});
-          gemm<false, -1>(tiled_mma_rope, thr_rope.partition_fragment_A(sQR), thr_rope.partition_fragment_B(sKRopeT),
-                          rP);
+          gemm<false, -1>(
+              tiled_mma_rope, thr_rope.partition_fragment_A(sQR), thr_rope.partition_fragment_B(sKRopeT), rP);
           cute::warpgroup_wait<0>();
         }
         (void)sK8buf;
@@ -478,9 +494,11 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             scale_for_olds[lr] = scale_for_old;
 
             CUTE_UNROLL
-            for (int i = 0; i < size(cur_rO0); ++i) cur_rO0(i) *= scale_for_old;
+            for (int i = 0; i < size(cur_rO0); ++i)
+              cur_rO0(i) *= scale_for_old;
             CUTE_UNROLL
-            for (int i = 0; i < size(cur_rO1); ++i) cur_rO1(i) *= scale_for_old;
+            for (int i = 0; i < size(cur_rO1); ++i)
+              cur_rO1(i) *= scale_for_old;
 
             float cur_sum = 0;
             CUTE_UNROLL
@@ -490,8 +508,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             }
             rL[lr] = rL[lr] * scale_for_old + cur_sum;
           }
-          if (idx_in_warpgroup % 4 == 0)
-            *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
+          if (idx_in_warpgroup % 4 == 0) *(float2*)(sScale + 2 * (idx_in_warpgroup / 4)) = *(float2*)(scale_for_olds);
         }
 
         // Per-block rescaled P: P̃_b = P * 2^{k_row} * 2^{s_{t,b}}, staged as
@@ -504,7 +521,8 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
             float mx = 0.f;
             CUTE_UNROLL
-            for (int i = 0; i < size(cur_rP); ++i) mx = max(mx, cur_rP(i));
+            for (int i = 0; i < size(cur_rP); ++i)
+              mx = max(mx, cur_rP(i));
             k_row[lr] = mx > 0.f ? (6.f - log2f(mx)) : 0.f;  // headroom for x2^{s_b}
             rK[lr] = k_row[lr];
           }
@@ -521,8 +539,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
           for (int b = 0; b < 4; ++b) {
             // Each 128-dim block gets its own 64x64 E4M3 tile.
             Tensor sS8b = make_tensor(
-                make_smem_ptr(plan.s8.data() + b * cosize_v<typename Kt::SmemLayoutS8>),
-                typename Kt::SmemLayoutS8{});
+                make_smem_ptr(plan.s8.data() + b * cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
             CUTE_UNROLL
             for (int lr = 0; lr < 2; ++lr) {
               Tensor cur_rP = flatten(rP(make_coord(_, lr, _), _, _));
@@ -548,13 +565,12 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
               make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<128>{}, _0{})),
               typename Kt::SmemLayoutK8PVTiles<2>{});
           Tensor sS8_0 = make_tensor(make_smem_ptr(plan.s8.data()), typename Kt::SmemLayoutS8{});
-          Tensor sS8_1 =
-              make_tensor(make_smem_ptr(plan.s8.data() + cosize_v<typename Kt::SmemLayoutS8>),
-                          typename Kt::SmemLayoutS8{});
-          gemm<false, -1>(tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_0),
-                          thr_PV128.partition_fragment_B(sB0), rO0);
-          gemm<false, -1>(tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_1),
-                          thr_PV128.partition_fragment_B(sB1), rO1);
+          Tensor sS8_1 = make_tensor(
+              make_smem_ptr(plan.s8.data() + cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
+          gemm<false, -1>(
+              tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_0), thr_PV128.partition_fragment_B(sB0), rO0);
+          gemm<false, -1>(
+              tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_1), thr_PV128.partition_fragment_B(sB1), rO1);
           cute::warpgroup_wait<0>();
         }
 
@@ -625,15 +641,16 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
           Tensor cur_r0 = flatten(rO0(make_coord(_, lr, _), _, _));
           Tensor cur_r1 = flatten(rO1(make_coord(_, lr, _), _, _));
           CUTE_UNROLL
-          for (int i = 0; i < size(cur_r0); ++i) cur_g0(i) = cur_r0(i) * o_scales[lr];
+          for (int i = 0; i < size(cur_r0); ++i)
+            cur_g0(i) = cur_r0(i) * o_scales[lr];
           CUTE_UNROLL
-          for (int i = 0; i < size(cur_r1); ++i) cur_g1(i) = cur_r1(i) * o_scales[lr];
+          for (int i = 0; i < size(cur_r1); ++i)
+            cur_g1(i) = cur_r1(i) * o_scales[lr];
         }
 
         if (idx_in_warpgroup < num_valid_seq_q) {
           float cur_L = sL[idx_in_warpgroup];
-          gLseAccum[idx_in_warpgroup] =
-              cur_L == 0.0f ? -INFINITY : log2f(cur_L) + sM[idx_in_warpgroup];
+          gLseAccum[idx_in_warpgroup] = cur_L == 0.0f ? -INFINITY : log2f(cur_L) + sM[idx_in_warpgroup];
         }
       }
 
@@ -647,7 +664,7 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
   // (RoPE BF16).  Mirrors the BF16 remote-PV warpgroup: reads the per-block
   // E4M3 P̃ tiles and the BF16 P staged by WG0.
   {
-    cutlass::arch::warpgroup_reg_dealloc<160>();
+    cutlass::arch::warpgroup_reg_dealloc<136>();
 
     auto tiled_mma_PV128 = typename Kt::TiledMMA_PV128_Fp8{};
     auto thr_PV128 = tiled_mma_PV128.get_slice(idx_in_warpgroup);
@@ -684,11 +701,14 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
           Tensor cur_rOt = flatten(rOt(make_coord(_, lr, _), _, _));
           Tensor cur_rOr = flatten(rOr(make_coord(_, lr, _), _, _));
           CUTE_UNROLL
-          for (int i = 0; i < size(cur_rO2); ++i) cur_rO2(i) *= cur_scales[lr];
+          for (int i = 0; i < size(cur_rO2); ++i)
+            cur_rO2(i) *= cur_scales[lr];
           CUTE_UNROLL
-          for (int i = 0; i < size(cur_rOt); ++i) cur_rOt(i) *= cur_scales[lr];
+          for (int i = 0; i < size(cur_rOt); ++i)
+            cur_rOt(i) *= cur_scales[lr];
           CUTE_UNROLL
-          for (int i = 0; i < size(cur_rOr); ++i) cur_rOr(i) *= cur_scales[lr];
+          for (int i = 0; i < size(cur_rOr); ++i)
+            cur_rOr(i) *= cur_scales[lr];
         }
 
         {
@@ -696,28 +716,27 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
               make_smem_ptr(plan.s8.data() + 2 * cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
           Tensor sS8_3 = make_tensor(
               make_smem_ptr(plan.s8.data() + 3 * cosize_v<typename Kt::SmemLayoutS8>), typename Kt::SmemLayoutS8{});
-          Tensor sB2 =
-              make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<256>{}, _0{})),
-                          typename Kt::SmemLayoutK8PVTiles<2>{});
-          Tensor sB3 =
-              make_tensor(make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<384>{}, _0{})),
-                          typename Kt::SmemLayoutK8PVTiles<1>{});
-          Tensor sRopeT = make_tensor(make_smem_ptr(plan.u.k[buf_idx].rope.data()),
-                                      typename Kt::SmemLayoutKRopeTransposed{});
+          Tensor sB2 = make_tensor(
+              make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<256>{}, _0{})),
+              typename Kt::SmemLayoutK8PVTiles<2>{});
+          Tensor sB3 = make_tensor(
+              make_smem_ptr(plan.u.k[buf_idx].k8pv.data() + (typename Kt::SmemLayoutK8PV{})(Int<384>{}, _0{})),
+              typename Kt::SmemLayoutK8PVTiles<1>{});
+          Tensor sRopeT =
+              make_tensor(make_smem_ptr(plan.u.k[buf_idx].rope.data()), typename Kt::SmemLayoutKRopeTransposed{});
 
-          gemm<false, -1>(tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_2),
-                          thr_PV128.partition_fragment_B(sB2), rO2);
-          gemm<false, -1>(tiled_mma_PV64, thr_PV64.partition_fragment_A(sS8_3),
-                          thr_PV64.partition_fragment_B(sB3), rOt);
-          gemm<false, -1>(tiled_mma_rope, thr_rope.partition_fragment_A(sS), thr_rope.partition_fragment_B(sRopeT),
-                          rOr);
+          gemm<false, -1>(
+              tiled_mma_PV128, thr_PV128.partition_fragment_A(sS8_2), thr_PV128.partition_fragment_B(sB2), rO2);
+          gemm<false, -1>(
+              tiled_mma_PV64, thr_PV64.partition_fragment_A(sS8_3), thr_PV64.partition_fragment_B(sB3), rOt);
+          gemm<false, -1>(
+              tiled_mma_rope, thr_rope.partition_fragment_A(sS), thr_rope.partition_fragment_B(sRopeT), rOr);
           cute::warpgroup_wait<0>();
         }
 
         plan.bar_k_avail[buf_idx].arrive();
 
-        if (block_idx != args.end_block_idx - 1)
-          NamedBarrier::arrive(256, Kt::NamedBarriers::sScale_and_sS_free);
+        if (block_idx != args.end_block_idx - 1) NamedBarrier::arrive(256, Kt::NamedBarriers::sScale_and_sS_free);
       }
 
       NamedBarrier::arrive_and_wait(256, Kt::NamedBarriers::oBuf_free_and_sL_ready);
@@ -757,11 +776,14 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
           Tensor cgr = flatten(tOgr(make_coord(_, lr, _), _, _));
           Tensor crr = flatten(rOr(make_coord(_, lr, _), _, _));
           CUTE_UNROLL
-          for (int i = 0; i < size(cr2); ++i) cg2(i) = cr2(i) * o_scales[lr];
+          for (int i = 0; i < size(cr2); ++i)
+            cg2(i) = cr2(i) * o_scales[lr];
           CUTE_UNROLL
-          for (int i = 0; i < size(crt); ++i) cgt(i) = crt(i) * o_scales[lr];
+          for (int i = 0; i < size(crt); ++i)
+            cgt(i) = crt(i) * o_scales[lr];
           CUTE_UNROLL
-          for (int i = 0; i < size(crr); ++i) cgr(i) = crr(i) * o_scales[lr];
+          for (int i = 0; i < size(crr); ++i)
+            cgr(i) = crr(i) * o_scales[lr];
         }
         (void)num_valid_seq_q;
       }
@@ -1435,8 +1457,9 @@ void KernelTemplate<NUM_HEADS, USE_FP8_MMA>::run(const SparseAttnDecodeParams& p
           SM90_TMA_LOAD{},
           make_tensor(
               make_gmem_ptr((bf16*)params.q_rope),
-              make_layout(make_shape(params.h_q, HEAD_DIM_ROPE, params.s_q, params.b),
-                          make_stride(params.stride_qrope_h_q, _1{}, params.stride_qrope_s_q, params.stride_qrope_b))),
+              make_layout(
+                  make_shape(params.h_q, HEAD_DIM_ROPE, params.s_q, params.b),
+                  make_stride(params.stride_qrope_h_q, _1{}, params.stride_qrope_s_q, params.stride_qrope_b))),
           SmemLayoutQRope{});
     } else {
       return cute::make_tma_copy(

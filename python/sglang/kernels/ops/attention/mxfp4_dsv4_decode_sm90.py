@@ -356,7 +356,7 @@ def flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma(
     indices: torch.Tensor,
     *,
     topk_length: Optional[torch.Tensor] = None,
-    tile_scheduler_metadata: "FlashMLASchedMeta",
+    tile_scheduler_metadata: FlashMLASchedMeta,
     softmax_scale: Optional[float] = None,
     attn_sink: Optional[torch.Tensor] = None,
     extra_k_cache: Optional[torch.Tensor] = None,
