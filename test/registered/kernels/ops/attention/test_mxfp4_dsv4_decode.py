@@ -25,10 +25,12 @@ try:
     from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import (
         FlashMLASchedMeta,
         flash_mla_with_kvcache_dsv4_mxfp4,
+        flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma,
     )
 except Exception as exc:
     FlashMLASchedMeta = None
     flash_mla_with_kvcache_dsv4_mxfp4 = None
+    flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma = None
     _flashmla_import_error = exc
 else:
     _flashmla_import_error = None
@@ -107,6 +109,7 @@ def _make_cache(
     page_size: int,
     minimum_tokens: int,
     generator: torch.Generator,
+    group_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     quantize, dequantize = _require_codec()
     device = torch.device("cuda")
@@ -132,6 +135,7 @@ def _make_cache(
         kv_buffer=raw,
         loc=physical_rows,
         page_size=page_size,
+        group_size=group_size,
     )
     dequantized = dequantize(
         raw,
@@ -181,6 +185,8 @@ def _build_case(
     extra_page_size: Optional[int] = None,
     extra_topk: int = 0,
     seed: int = 20260714,
+    group_size: int = 32,
+    swa_topk: int = _SWA_TOPK,
 ) -> _DecodeCase:
     assert h_q in (64, 128)
     assert (extra_page_size is None) == (extra_topk == 0)
@@ -198,13 +204,14 @@ def _build_case(
     )
     kv, dequantized_kv = _make_cache(
         page_size=_SWA_PAGE_SIZE,
-        minimum_tokens=batch_size * _SWA_TOPK,
+        minimum_tokens=batch_size * swa_topk,
         generator=generator,
+        group_size=group_size,
     )
     kv_capacity = kv.shape[0] * kv.shape[1]
     indices, topk_length = _make_indices(
         batch_size=batch_size,
-        width=_SWA_TOPK,
+        width=swa_topk,
         capacity=kv_capacity,
         generator=generator,
     )
@@ -224,6 +231,7 @@ def _build_case(
             page_size=extra_page_size,
             minimum_tokens=batch_size * extra_topk,
             generator=generator,
+            group_size=group_size,
         )
         extra_capacity = extra_kv.shape[0] * extra_kv.shape[1]
         extra_indices, extra_topk_length = _make_indices(
@@ -382,6 +390,82 @@ def test_flashmla_dsv4_mxfp4_multirequest_parts_no_deadlock() -> None:
         assert bool(torch.isfinite(lse).all())
         torch.testing.assert_close(out, out_ref, atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL)
         torch.testing.assert_close(lse, lse_ref, atol=_LSE_ATOL, rtol=_LSE_RTOL)
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_fp8_mma_multirequest_split_matches_bf16() -> None:
+    """FP8-WGMMA variant tracks the BF16-MMA kernel across split schedules.
+
+    The FP8 mainloop is a separate kernel implementation: it repacks E2M1 to
+    E4M3 and applies the E8M0 block scales outside the WGMMA — per 128-dim
+    block on the QK partials, and per block on P before PV, folded back
+    through the row scale. Bugs in that decomposition (block-scale indexing,
+    rescaled-P staging, the per-split epilogue rescale, the attention-sink
+    term) degrade outputs gradually instead of failing loudly, and a
+    multi-request schedule with per-request splits exercises the
+    split-accumulator path that single-request cases never reach.
+
+    The comparison baseline is the BF16-MMA kernel on the same 128-dim-group
+    cache (E2M1->E4M3 repacking is lossless, so the only divergence is the
+    E4M3-quantized Q and P). A 2048-token top-k gives every request 32 KV
+    blocks, so at batch 16 the tile scheduler splits requests across SM parts.
+    """
+    if flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma is None:
+        pytest.fail(f"FP8-MMA wrapper is unavailable: {_flashmla_import_error}")
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    case = _build_case(
+        h_q=64,
+        batch_size=16,
+        extra_page_size=64,
+        extra_topk=512,
+        group_size=128,
+        swa_topk=2048,
+    )
+
+    out_ref, lse_ref = _run_native(native, case, FlashMLASchedMeta())
+    out_f8, lse_f8 = flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma(
+        q=case.q,
+        k_cache=case.kv,
+        indices=case.indices,
+        topk_length=case.topk_length,
+        tile_scheduler_metadata=FlashMLASchedMeta(),
+        softmax_scale=case.sm_scale,
+        attn_sink=case.attn_sink,
+        extra_k_cache=case.extra_kv,
+        extra_indices_in_kvcache=case.extra_indices,
+        extra_topk_length=case.extra_topk_length,
+    )
+
+    assert out_f8.shape == out_ref.shape
+    assert bool(torch.isfinite(out_f8).all())
+    assert bool(torch.isfinite(lse_f8).all())
+    cos = torch.nn.functional.cosine_similarity(
+        out_ref.float().flatten(), out_f8.float().flatten(), dim=0
+    )
+    assert cos.item() >= 0.999, f"cosine similarity degraded: {cos.item():.6f}"
+    lse_gap = (lse_ref - lse_f8).abs().max().item()
+    assert lse_gap <= 5e-4, f"lse gap too large: {lse_gap:.3e}"
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_fp8_mma_rejects_h128() -> None:
+    """The FP8-MMA instantiation covers the h_q=64 geometry only (CLUSTER_SIZE
+    1); an h_q=128 call must fail loudly at the wrapper instead of falling
+    back to a path whose layouts were never compiled."""
+    if flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma is None:
+        pytest.fail(f"FP8-MMA wrapper is unavailable: {_flashmla_import_error}")
+    case = _build_case(h_q=128, batch_size=1)
+    with pytest.raises(ValueError, match="FP8-MMA decode requires h_q=64"):
+        flash_mla_with_kvcache_dsv4_mxfp4_fp8_mma(
+            q=case.q,
+            k_cache=case.kv,
+            indices=case.indices,
+            topk_length=case.topk_length,
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+        )
 
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
