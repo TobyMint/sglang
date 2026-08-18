@@ -267,12 +267,6 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             const uint4 bytes = {lo.x, lo.y, hi.x, hi.y};
             // QK orientation: one 16-byte granule at (token, dim).
             *reinterpret_cast<uint4*>(&sK8buf(my_token, logical_dim)) = bytes;
-            // PV orientation: scattered per-byte writes at (dim, token).
-            const Fp8T* vals = reinterpret_cast<const Fp8T*>(&bytes);
-            CUTE_UNROLL
-            for (int j = 0; j < 16; ++j) {
-              sK8PVbuf(logical_dim + j, my_token) = vals[j];
-            }
           }
 
           CUTE_UNROLL
@@ -285,6 +279,50 @@ __device__ void devfunc_fp8_mainloop(const SparseAttnDecodeParams& params, const
             }
             *reinterpret_cast<__int128_t*>(&sKRopeBuf(my_token, rope_dim)) =
                 *reinterpret_cast<const __int128_t*>(&rope);
+          }
+        }
+
+        // Pass-2 reads granules other warps staged in pass 1: make every
+        // pass-1 store visible across the producer warpgroup first.
+        NamedBarrier::arrive_and_wait(128, 14);
+
+        // PV orientation as a second pass with a token-quartet mapping:
+        // each lane repacks four consecutive tokens for an 8-dim slice and
+        // packs the four per-dim bytes into single 32-bit stores — full-width
+        // shared transactions instead of the scattered per-byte writes
+        // (which cost half the kernel time at production geometries).
+        {
+          const int tq = producer_warp_idx * 4 + (lane_idx % 8) / 2;  // token quartet 0..15
+          const int dim_half = (lane_idx % 8) % 2;
+          const int dim_group = lane_idx / 8;  // 0..3
+          CUTE_UNROLL
+          for (int dim_idx = 0; dim_idx < Kt::HEAD_DIM_NOPE / 64; ++dim_idx) {
+            const int slice = dim_idx * 64 + dim_group * 16 + dim_half * 8;  // 8 dims
+            // Read the E4M3 bytes pass 1 already staged (zero extra global
+            // traffic, no repack): eight dims of each of the four tokens.
+            const uint2 r0 = *reinterpret_cast<const uint2*>(&sK8buf(tq * 4 + 0, slice));
+            const uint2 r1 = *reinterpret_cast<const uint2*>(&sK8buf(tq * 4 + 1, slice));
+            const uint2 r2 = *reinterpret_cast<const uint2*>(&sK8buf(tq * 4 + 2, slice));
+            const uint2 r3 = *reinterpret_cast<const uint2*>(&sK8buf(tq * 4 + 3, slice));
+            CUTE_UNROLL
+            for (int j = 0; j < 4; ++j) {
+              // bytes {r0.bj, r1.bj, r2.bj, r3.bj} via two PRMTs and a shift.
+              // Pick byte j of tokens 0/1 into the low half (PRMT nibbles 2/3
+              // are don't-cares, masked off), tokens 2/3 land via the shift.
+              const uint32_t sel = ((4 + j) << 4) | j;
+              const uint32_t a = __byte_perm(r0.x, r1.x, sel) & 0xffffu;
+              const uint32_t b = __byte_perm(r2.x, r3.x, sel) & 0xffffu;
+              *reinterpret_cast<uint32_t*>(&sK8PVbuf(slice + j, tq * 4)) = a | (b << 16);
+            }
+            CUTE_UNROLL
+            for (int j = 0; j < 4; ++j) {
+              // Selector nibbles 2/3 have their MSB set: PRMT zero-fills
+              // those output bytes, so 'a' carries only the two picked bytes.
+              const uint32_t sel = ((4 + j) << 4) | j;
+              const uint32_t a = __byte_perm(r0.y, r1.y, sel) & 0xffffu;
+              const uint32_t b = __byte_perm(r2.y, r3.y, sel) & 0xffffu;
+              *reinterpret_cast<uint32_t*>(&sK8PVbuf(slice + 4 + j, tq * 4)) = a | (b << 16);
+            }
           }
         }
 
