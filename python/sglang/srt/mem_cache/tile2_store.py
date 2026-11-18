@@ -1013,17 +1013,22 @@ class Tile2Driver:
         place where the two can be joined.
         """
         known = self._rid_by_req.get(rid)
-        if known is None:
+        first = known is None
+        if first:
             known = self._rid_next
             self._rid_next += 1
             self._rid_by_req[rid] = known
         self._row_rid[row] = known
+        return first
 
     def key_of_row(self, row: int, fallback=None) -> int:
         """Stable per-request key for this row, else `fallback` (or the union of both worlds)."""
         k = self._row_rid.get(row)
         if k is not None:
             return k
+        if os.environ.get("SGLANG_TILE2_KEYDBG") == "1":
+            print(f"[T2KEY-MISS] row={row} has no rid (the scheduler hook never described it); "
+                  f"falling back to slot-0={fallback}", flush=True)
         if fallback is not None:
             return fallback
         # Rows the scheduler hook has not described are capture-time synthetic batches; they never
@@ -1363,8 +1368,18 @@ class Tile2Driver:
             # attention (it reads slots from `pos_slot`, not from req_to_token, because a chunked
             # prefill changes req_to_token rows). Copy the inherited range in once, from the row
             # that still holds it, on the request's first step.
-            if getattr(fb, "extend_prefix_lens_cpu", None) is not None:
-                _pre_lens = fb.extend_prefix_lens_cpu
+            # `extend_prefix_lens_cpu` is Optional and is NOT populated in every code path; when it
+            # is None this entire block used to be skipped, so an inherited prefix never reached
+            # the position table and the fused kernel masked it out of attention (the warm request
+            # then attends only to its own tail -- coherent-looking garbage). Fall back to the
+            # device tensor and pay one sync here: this is the extend path, never captured.
+            _pl = getattr(fb, "extend_prefix_lens_cpu", None)
+            if _pl is None:
+                _dev = getattr(fb, "extend_prefix_lens", None)
+                if _dev is not None:
+                    _pl = [int(x) for x in _dev.tolist()]
+            if _pl is not None:
+                _pre_lens = _pl
                 for _i, (r_, k_) in enumerate(zip(rows, keys)):
                     _np = int(_pre_lens[_i]) if _i < len(_pre_lens) else 0
                     if _np <= 0:
@@ -1548,16 +1563,20 @@ def install(pool) -> None:
     _orig_gmwb = getattr(ScheduleBatch, "get_model_worker_batch", None)
     if _orig_gmwb is not None and not getattr(_orig_gmwb, "_tile2_bound", False):
         def _gmwb(self, *a, **kw):
-            try:
-                drv = pool.tile2_drv
-                idx = self.req_pool_indices
-                for i, req in enumerate(self.reqs):
-                    drv.note_request(int(idx[i]), req.rid)
-            except Exception:
-                pass
+            drv = pool.tile2_drv
+            idx = self.req_pool_indices
+            _dbg = os.environ.get("SGLANG_TILE2_KEYDBG") == "1"
+            print("[T2HOOK-CALL] reqs=%d" % len(self.reqs), flush=True)
+            for i, req in enumerate(self.reqs):
+                _row = int(idx[i])
+                _new = drv.note_request(_row, req.rid)
+                if _dbg:
+                    print(f"[T2KEY] row={_row} rid={req.rid} key={drv._row_rid[_row]} "
+                          f"first_seen={_new}", flush=True)
             return _orig_gmwb(self, *a, **kw)
         _gmwb._tile2_bound = True
         ScheduleBatch.get_model_worker_batch = _gmwb
+        print("[T2HOOK] ScheduleBatch.get_model_worker_batch patched", flush=True)
 
     def bracket(fn):
         def inner(self, q, k, v, layer, forward_batch, save_kv_cache=True):
