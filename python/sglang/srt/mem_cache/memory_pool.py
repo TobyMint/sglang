@@ -421,9 +421,21 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
         # MXFP4 (block32 E8M0): packed fp4 data + per-block scale buffers.
         self.is_mxfp4 = kv_cache_recipe == "fp4_mx_block32"
+        # Real 4-bit storage (stage 1 of BudgetKV): uint8 payload + fp16 scale/zero.
+        self.is_packed_int2 = kv_cache_recipe == "packed_int2"
+        self.is_packed_int4 = kv_cache_recipe in ("packed_int4", "packed_int2")
+        self.is_packed_tile2 = kv_cache_recipe == "packed_tile2"
+        if self.is_packed_int4:
+            assert head_dim % 32 == 0, "packed_int4 needs head_dim divisible by the group size"
+            self._int4_group = 32
         assert not self.is_mxfp4 or head_dim == 128, (
             "MXFP4 KV cache only supports head_dim=128 (Qwen3)"
         )
+        # Reproduction shim: quantize-dequantize the KV on write (bf16 storage kept).
+        from sglang.srt.mem_cache.kv_qdq import build as _build_qdq
+        self._qdq = _build_qdq(kv_cache_recipe)
+        self._qdq_pending = {}
+        print(f"[QDQ] built recipe={kv_cache_recipe!r} handler={type(self._qdq).__name__ if self._qdq else None}", flush=True)
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
@@ -440,8 +452,23 @@ class MHATokenToKVPool(KVCache):
 
         self._create_buffers()
 
+        if __import__("os").environ.get("SGLANG_KVDUMP"):
+            # Cross-arm observer: dump the rows this layer actually attends on, once per process.
+            from sglang.srt.mem_cache.tile2_store import install_kv_dump
+            install_kv_dump(self)
+
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
+        if getattr(self, "is_packed_int4", False):
+            G = self._int4_group
+            _pw = self.head_dim // (4 if getattr(self, "is_packed_int2", False) else 2)
+            # per *head*: payload + (fp16 scale, uint8 zero) per 32-channel group, K and V
+            per_head = _pw * 2 + (self.head_dim // G) * 3 * 2
+            nh = self.head_num
+            per_tok = per_head * nh
+            bf16_tok = self.head_dim * 2 * 2 * nh
+            print(f"[INT4] packed KV pool: {self.size} tokens, {per_tok} B/token/layer "
+                  f"vs {bf16_tok} B for bf16 ({bf16_tok / per_tok:.2f}x denser)", flush=True)
         self._finalize_allocation_log(size)
 
     def _create_buffers(self):
@@ -453,8 +480,8 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                if self.is_mxfp4:
-                    # No bf16 buffers in MXFP4 mode; packed fp4 + scale buffers below.
+                if self.is_mxfp4 or self.is_packed_int4 or self.is_packed_tile2:
+                    # No bf16 buffers: the payload lives in its own packed buffers.
                     self.k_buffer = []
                     self.v_buffer = []
                 else:
@@ -510,6 +537,83 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+
+        if self.is_packed_int4:
+            G = self._int4_group
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                _pk = self.head_dim // (4 if getattr(self, "is_packed_int2", False) else 2)
+                self.k_data_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, _pk),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)]
+                self.v_data_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, _pk),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)]
+                self.k_scale_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, self.head_dim // G),
+                                dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)]
+                self.k_zero_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, self.head_dim // G),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)]
+                self.v_scale_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, self.head_dim // G),
+                                dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)]
+                self.v_zero_buffer = [
+                    torch.zeros((self.size + self.page_size, self.head_num, self.head_dim // G),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)]
+
+        if self.is_packed_int4:
+            # Incremental bf16 shadow: the cache barely changes during decode (one token per
+            # step), so dequantising the whole active set every step is pure waste. Each token
+            # is dequantised ONCE, at write time, into a compact row; attention then reads the
+            # shadow through a slot->row map. ~33 MB/layer for 16k active tokens.
+            import os as _os
+            self.i4_cap = min(self.size + self.page_size, 24576)
+            # Only the stage-2 path reads the shadow; every other mode would pay 3.6 GB of
+            # capacity and five ops per layer per step for nothing.
+            self.i4_want_shadow = _os.environ.get("SGLANG_INT4_SHADOW") == "1"
+            if not self.i4_want_shadow:
+                self.i4_shadow_k = []
+                self.i4_shadow_v = []
+                self.i4_slot2row = None
+                self.i4_next_row = 0
+                self.i4_overflow = True
+                print("[INT4] shadow: disabled (packed-fused mode) -> no extra 3.6 GB",
+                      flush=True)
+            if self.i4_want_shadow:
+                with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                    self.i4_shadow_k = [
+                        torch.zeros((self.i4_cap, self.head_num, self.head_dim),
+                                    dtype=torch.bfloat16, device=self.device)
+                        for _ in range(self.layer_num)]
+                    self.i4_shadow_v = [
+                        torch.zeros((self.i4_cap, self.head_num, self.head_dim),
+                                    dtype=torch.bfloat16, device=self.device)
+                        for _ in range(self.layer_num)]
+            self.i4_slot2row = (torch.full((self.size + self.page_size,), -1,
+                                           dtype=torch.int32, device=self.device)
+                                if self.i4_want_shadow else None)
+            self.i4_next_row = 0
+            self.i4_overflow = False if self.i4_want_shadow else True
+            print(f"[INT4] shadow rows/layer={self.i4_cap} "
+                  f"({self.i4_cap * self.head_num * self.head_dim * 2 * 2 * self.layer_num / 1e9:.2f} GB total)",
+                  flush=True)
+
+        if self.is_packed_tile2:
+            # The tile store owns every byte of the KV cache in this mode; there is no bf16 pool.
+            from sglang.srt.mem_cache.tile2_store import Tile2Buffers, Tile2Driver, install
+            self.tile2_buf = Tile2Buffers(
+                size=self.size, page_size=self.page_size, head_num=self.head_num,
+                head_dim=self.head_dim, layer_num=self.layer_num, device=self.device,
+                max_staging=int(__import__("os").environ.get("SGLANG_TILE2_STAGING", "8")))
+            self.tile2_drv = Tile2Driver(self.tile2_buf)
+            print(self.tile2_buf.report(), flush=True)
+            install(self)
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -664,10 +768,23 @@ class MHATokenToKVPool(KVCache):
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
-        assert not self.is_mxfp4, (
+        assert not (self.is_mxfp4 or self.is_packed_int4), (
             "get_kv_buffer is not supported in MXFP4 mode; use get_kv_fp4_buffers + dequantize"
         )
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_int4_shadow(self, layer_id: int):
+        """bf16 shadow of the active rows plus the slot->row map (stage-2 fast path)."""
+        i = layer_id - self.start_layer
+        return (self.i4_shadow_k[i], self.i4_shadow_v[i],
+                self.i4_slot2row, self.i4_next_row, self.i4_overflow)
+
+    def get_kv_int4_buffers(self, layer_id: int):
+        """Return the six packed INT4 buffers of a layer."""
+        assert self.is_packed_int4, "get_kv_int4_buffers requires packed_int4 mode"
+        i = layer_id - self.start_layer
+        return (self.k_data_buffer[i], self.k_scale_buffer[i], self.k_zero_buffer[i],
+                self.v_data_buffer[i], self.v_scale_buffer[i], self.v_zero_buffer[i])
 
     def get_kv_fp4_buffers(self, layer_id: int):
         """Return (k_data, k_scale, v_data, v_scale) packed buffers for a layer."""
@@ -697,6 +814,125 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
 
+        if self.is_packed_tile2:
+            # No bf16 pool exists: the write is diverted into the request's open tile, and any
+            # tile this write completes is quantised and packed before the attention read below.
+            from sglang.srt.mem_cache.tile2_store import state
+            fb = state().get("fb")
+            if fb is None:
+                return
+            self.tile2_drv.step(layer_id - self.start_layer, fb, cache_k, cache_v, loc)
+            return
+
+        if self.is_packed_int4:
+            import os as _os2
+            if (_os2.environ.get("SGLANG_INT2_PROBE") == "1"
+                    and not getattr(self, "_i2_probe_done", False)
+                    and cache_k.shape[0] >= 128):
+                self._i2_probe_done = True
+                try:
+                    import torch as _t
+                    from sglang.srt.mem_cache.kv_qdq import _hadamard, _rtn_axis, _asym_int
+
+                    kk = cache_k.detach().float()
+                    T, H, D = kk.shape
+                    sig = kk.pow(2).mean().sqrt().item()
+
+                    naive, _ = _asym_int(cache_k.detach(), 2, group_dim=-1)
+                    e_naive = (naive.float() - kk).pow(2).mean().sqrt().item()
+
+                    h = _hadamard(D, kk.device, kk.dtype)
+                    tile = (T // 128) * 128
+                    if tile > 0:
+                        x = (kk[:tile] @ h).view(tile // 128, 128, H, D)
+                        acc = _t.ones_like(x)
+                        for _ in range(8):
+                            sc = x.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_(min=1e-8)
+                            x = x / sc; acc = acc * sc
+                            sr = x.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_(min=1e-8)
+                            x = x / sr; acc = acc * sr
+                        q = _rtn_axis(x, 2, axis=1) * acc
+                        rec = (q.reshape(tile, H, D) @ h.float())
+                        e_kv = (rec - kk[:tile]).pow(2).mean().sqrt().item()
+                        print(f"[I2PROBE] T={T} H={H} D={D} signal_rms={sig:.4f} "
+                              f"naive_2bit={e_naive:.4f} ({e_naive/sig*100:.1f}%) "
+                              f"kvarn_2bit={e_kv:.4f} ({e_kv/sig*100:.1f}%) "
+                              f"ratio={e_naive/e_kv:.2f}x", flush=True)
+                        # and at 4 bits, for the operating point we actually serve
+                        n4, _ = _asym_int(cache_k.detach(), 4, group_dim=-1)
+                        e4 = (n4.float() - kk).pow(2).mean().sqrt().item()
+                        print(f"[I2PROBE] naive_4bit={e4:.4f} ({e4/sig*100:.1f}%)", flush=True)
+                except Exception as e:
+                    print(f"[I2PROBE] failed: {type(e).__name__}: {e}", flush=True)
+            # Real 4-bit write: quantise + pack straight into the pool.
+            import os as _os0
+            if _os0.environ.get("SGLANG_INT4_NOPACK") == "1":
+                return
+            from sglang.srt.mem_cache.int4_store import store as _i4_store
+            from sglang.srt.mem_cache.int4_kv_kernels import quantize_store_kv
+            i = layer_id - self.start_layer
+            if self.is_packed_int2:
+                from sglang.srt.mem_cache.int4_kv_kernels import quantize_store_i2
+                quantize_store_i2(cache_k, loc, self.k_data_buffer[i], self.k_scale_buffer[i],
+                                  self.k_zero_buffer[i])
+                quantize_store_i2(cache_v, loc, self.v_data_buffer[i], self.v_scale_buffer[i],
+                                  self.v_zero_buffer[i])
+                if not getattr(self, "_i2_checked", False) and cache_k.shape[0] >= 4:
+                    self._i2_checked = True
+                    try:
+                        import torch as _t
+                        from sglang.srt.mem_cache.int4_kv_kernels import (
+                            gather_dequant_i2 as _g, ref_quantize_i2 as _rq, ref_dequant_i2 as _rd)
+                        _n = min(4, cache_k.shape[0])
+                        _idx = loc[:_n].to(_t.int32)
+                        _probe = _t.empty((_n, self.head_num, self.head_dim),
+                                          dtype=_t.bfloat16, device="cuda")
+                        _g(self.k_data_buffer[i], self.k_scale_buffer[i],
+                           self.k_zero_buffer[i], _idx, _probe)
+                        _rp, _rs, _rz = _rq(cache_k[:_n])
+                        _expect = _rd(_rp, _rs, _rz)
+                        _d = (_probe.float() - _expect.float()).abs().max().item()
+                        _stored = (_rd(self.k_data_buffer[i][loc[:_n].long()],
+                                       self.k_scale_buffer[i][loc[:_n].long()],
+                                       self.k_zero_buffer[i][loc[:_n].long()])
+                                   .float() - _expect.float()).abs().max().item()
+                        _e = (_probe.float() - _expect.float()).abs()
+                        for _r in range(_n):
+                            _per_head = _e[_r].max(dim=-1).values.tolist()
+                            print(f"[I2-PAT] row{_r} slot={int(loc[_r])} "
+                                  f"err_per_head={[round(v,3) for v in _per_head]}", flush=True)
+                        print(f"[I2-NUM] expect0={_expect[0,0,:6].float().tolist()}", flush=True)
+                        print(f"[I2-NUM] srck0={cache_k[0,0,:6].float().tolist()}", flush=True)
+                        print(f"[I2-DIAG] cache_k={tuple(cache_k.shape)} head_num={self.head_num} "
+                              f"head_dim={self.head_dim} payload={self.k_data_buffer[i].shape[-1]} "
+                              f"loc={loc[:4].tolist()} contig={cache_k.is_contiguous()} "
+                              f"dtype={cache_k.dtype}", flush=True)
+                        print(f"[I2-CHECK] layer={layer_id} read-vs-ref={_d:.6f} "
+                              f"stored-vs-ref={_stored:.6f} "
+                              f"datawidth={self.k_data_buffer[i].shape[-1]}", flush=True)
+                    except Exception as _e:
+                        print(f"[I2-CHECK] failed: {type(_e).__name__}: {_e}", flush=True)
+                return
+            _i4_store(cache_k, cache_v, loc,
+                      self.k_data_buffer[i], self.k_scale_buffer[i], self.k_zero_buffer[i],
+                      self.v_data_buffer[i], self.v_scale_buffer[i], self.v_zero_buffer[i])
+
+            if self.i4_shadow_k and not self.i4_overflow:
+                nrow = loc.shape[0]
+                if self.i4_next_row + nrow > self.i4_cap:
+                    # Out of shadow rows: fall back to the on-the-fly dequant path for the
+                    # rest of the run rather than corrupting live rows.
+                    self.i4_overflow = True
+                    print("[INT4] shadow overflow -> falling back to per-step dequant", flush=True)
+                else:
+                    rows = torch.arange(self.i4_next_row, self.i4_next_row + nrow,
+                                        device=self.device, dtype=torch.int32)
+                    self.i4_next_row += nrow
+                    self.i4_slot2row[loc.long()] = rows
+                    self.i4_shadow_k[i].index_copy_(0, rows.long(), cache_k)
+                    self.i4_shadow_v[i].index_copy_(0, rows.long(), cache_v)
+            return
+
         if self.is_mxfp4:
             # Quantize bf16 K/V and store packed fp4 + E8M0 scales (one launch).
             from sglang.srt.layers.jit_kernels.mxfp4_kv import quantize_and_store_kv
@@ -708,6 +944,15 @@ class MHATokenToKVPool(KVCache):
                 self.v_data_buffer[local_id], self.v_scale_buffer[local_id],
             )
             return
+
+        _qdq = getattr(self, "_qdq", None)
+        _win = getattr(_qdq, "recent", 0) if _qdq is not None else 0
+        if _qdq is not None and _win == 0:
+            if not getattr(self, "_qdq_dbg", False):
+                self._qdq_dbg = True
+                print(f"[QDQ] immediate class={type(self).__name__} method={_qdq.method} "
+                      f"k={tuple(cache_k.shape)}", flush=True)
+            cache_k, cache_v = _qdq(cache_k, cache_v, layer_id)
 
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
@@ -732,6 +977,18 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+        if _qdq is not None and _win > 0:
+            # KIVI-style residual window: rows stay fp16 until they age out, then get quantized.
+            buf_k = self.k_buffer[layer_id - self.start_layer]
+            buf_v = self.v_buffer[layer_id - self.start_layer]
+            pend = self._qdq_pending.setdefault(layer_id, [])
+            pend.append((loc, cache_k.clone(), cache_v.clone()))
+            while len(pend) > _win:
+                l0, k0, v0 = pend.pop(0)
+                kq, vq = _qdq(k0, v0, layer_id)
+                buf_k[l0] = kq
+                buf_v[l0] = vq
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         copy_all_layer_kv_cache[(len(self.data_ptrs),)](
@@ -1008,6 +1265,15 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
     ):
         layer_id = layer.layer_id
+        _qdq = getattr(self, "_qdq", None)
+        _win = getattr(_qdq, "recent", 0) if _qdq is not None else 0
+        if _qdq is not None and _win == 0:
+            if not getattr(self, "_qdq_dbg", False):
+                self._qdq_dbg = True
+                print(f"[QDQ] immediate class={type(self).__name__} method={_qdq.method} "
+                      f"k={tuple(cache_k.shape)}", flush=True)
+            cache_k, cache_v = _qdq(cache_k, cache_v, layer_id)
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)

@@ -212,6 +212,11 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        try:
+            self.attn_backend.attn_backend._kv_pool = self.token_to_kv_pool
+        except Exception:
+            pass
+
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -1090,6 +1095,7 @@ class ModelRunner:
         return result
 
     def profile_max_num_token(self, total_gpu_memory: int):
+        self._fixed_kv_overhead = getattr(self, "_fixed_kv_overhead", 0)
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -1112,6 +1118,44 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+        elif self.server_args.kv_cache_dtype == "packed_int2":
+            G = 32
+            cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim // 4
+                   + (self.model_config.head_dim // G) * 2 + (self.model_config.head_dim // G))
+                * 2 * num_layers)
+        elif self.server_args.kv_cache_dtype == "packed_tile2":
+            # 2-bit payload plus the per-tile fp16 parameters, amortised over the tile. Computed
+            # from the shape rather than quoted: this number decides how many tokens the pool
+            # holds, and an earlier packed format silently allocated half of what it charged.
+            T = 128
+            kvh = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            hd = self.model_config.head_dim
+            payload = kvh * (hd // 4) * 2                      # K and V, 2 bits/element
+            params = (4 * kvh * hd + 4 * T * kvh) * 2 // T     # fp16 per tile, expressed per token
+            cell_size = (payload + params) * num_layers + 4    # +4: the per-slot position map
+            # The staging window is a fixed allocation (one open tile per active request per
+            # layer). Charging it per token would be circular, so it is subtracted from the
+            # available memory just below, which is exact.
+            _stg_rows = int(__import__("os").environ.get("SGLANG_TILE2_STAGING", "8"))
+            self._fixed_kv_overhead = (2 * num_layers * _stg_rows * T * kvh * hd * 2)
+        elif self.server_args.kv_cache_dtype == "packed_int4":
+            # Real 4-bit: uint8 payload (head_dim/2) plus, per 32-channel group, a fp16 scale
+            # (2 B) and a uint8 integer zero-point (1 B) - 3 B of metadata, not 4. Charging 4
+            # over-estimates by 5%, and the estimate is what the pool is sized from, so the
+            # difference became unusable memory.
+            G = 32
+            cell_size = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim // 2
+                   + (self.model_config.head_dim // G) * 3)
+                * 2
+                * num_layers
+            )
+        elif self.server_args.kv_cache_dtype == "packed_int4":
+            # Payload is uint8 in the pool; attention runs in bf16 after dequant.
+            self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_mx_block32":
             # MXFP4: packed E2M1 data (head_dim//2 B/head) + E8M0 exponent-only
             # scale (head_dim//block B/head), per K and V.
@@ -1142,12 +1186,11 @@ class ModelRunner:
                 * self.model_config.hf_config.mamba_cache_per_req
                 / (1 << 30)
             )
-        if self.server_args.kv_cache_dtype == "fp4_mx_block32":
-            # Reserve ~2.5 GB for activations: the fp4 pool is denser than bf16
-            # (same rest_memory budget, ~3.7x tokens), leaving no slack for
-            # concurrent decode/prefill activations — OOMs under load.
-            rest_memory -= 2.5
-        max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        # A fixed allocation that is not per token (the tile store's staging window) has to come
+        # out of the budget before the division, otherwise the pool is sized as if it were free
+        # and the server dies on the first long generation.
+        max_num_token = int((rest_memory * (1 << 30) - self._fixed_kv_overhead) // cell_size)
+
         return max_num_token
 
     @property
@@ -1258,9 +1301,20 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "packed_int2":
+            self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype == "packed_tile2":
+            # Payload is uint8 in the pool; attention runs in bf16 on a dequantised workspace.
+            self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype in ("packed_int2", "packed_int4"):
+            # uint8 payload in the pool; attention math runs in bf16 after dequant.
+            self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_mx_block32":
             # Stored as packed uint8; pool allocates data + scale buffers.
             self.kv_cache_dtype = torch.uint8
+        elif self.server_args.kv_cache_dtype.startswith("qdq_"):
+            # Reproduction mode: keep bf16 storage, quantize/dequantize on the write path.
+            self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

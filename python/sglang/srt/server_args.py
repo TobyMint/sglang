@@ -1030,8 +1030,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "fp4_mx_block32"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "fp4_mx_block32" is the MXFP4 recipe (block32 E8M0) for sm86+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "fp4_mx_block32", "qdq_kivi4", "qdq_kivi_axis4", "qdq_saw_int4", "qdq_kvarn2", "qdq_oscar2", "qdq_oscar2a", "qdq_axis_a4", "qdq_axis_b4", "qdq_mxfp4_qdq", "qdq_mxfp4_nowin", "qdq_fmt_sym4", "qdq_fmt_e2m1aff", "qdq_fmt_mxfp4", "qdq_fmt_e8best", "qdq_fmt_e4m3", "qdq_axis_a4", "qdq_axis_b4", "qdq_oscar2a", "packed_int4", "packed_int2", "packed_tile2", "qdq_saw4_tile", "qdq_q2r0", "qdq_q2r128", "qdq_q4r0", "qdq_q4r128", "qdq_kv2r0", "qdq_kv2r128", "qdq_kv4r0", "qdq_kv4r128", "qdq_kv2pw0", "qdq_kv4pw0", "qdq_q8r0", "qdq_q6r0", "qdq_fmt_sym4", "qdq_fmt_e2m1aff", "qdq_fmt_mxfp4"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+. "fp4_mx_block32" is the MXFP4 recipe (block32 E8M0) for sm86+. "qdq_<method>" reproduces a published KV quantization method in-place (bf16 storage, quantize-dequantize on write) for accuracy reproduction. "packed_int4" stores real 4-bit asymmetric INT4 KV (uint8 payload + fp16 scale/zero per 32 channels) and dequantises on read.',
         )
 
         # Memory and scheduling

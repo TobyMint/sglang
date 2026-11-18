@@ -125,6 +125,16 @@ class FlashInferAttnBackend(AttentionBackend):
         # MXFP4 (block32) support: decode/prefill read packed fp4 KV via a
         # dequant workspace; pool stores data + scale buffers.
         self.is_mxfp4 = model_runner.server_args.kv_cache_dtype == "fp4_mx_block32"
+        self.is_packed_int4 = model_runner.server_args.kv_cache_dtype in ("packed_int4", "packed_int2")
+        self.is_packed_tile2 = model_runner.server_args.kv_cache_dtype == "packed_tile2"
+        if self.is_packed_int4:
+            self._ws_i4 = None
+            import os as _os0
+            if (_os0.environ.get("SGLANG_INT4_CUDA") == "1"
+                    and _os0.environ.get("SGLANG_INT4_PREALLOC") == "1"):
+                from sglang.srt.mem_cache import int4_splitk as _sk0
+                _sk0.prepare(torch.device("cuda", torch.cuda.current_device()))
+        self._i4_out = None
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -331,6 +341,14 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        import os as _os1
+        if (getattr(self, "is_packed_int4", False)
+                and _os1.environ.get("SGLANG_INT4_CUDA") == "1"
+                and not getattr(self, "_i4_prepared", False)):
+            from sglang.srt.mem_cache import int4_splitk as _sk1
+            _sk1.prepare(torch.device("cuda", torch.cuda.current_device()),
+                         max_rows=1024, max_hq=64)
+            self._i4_prepared = True
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -508,7 +526,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self._packed_kv_for_attn(layer, forward_batch),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
                 window_left=layer.sliding_window_size,
@@ -560,6 +578,26 @@ class FlashInferAttnBackend(AttentionBackend):
                     dequantize_indices(k_data, k_scale, indices[:n], ws_k)
                     dequantize_indices(v_data, v_scale, indices[:n], ws_v)
                     kv = (ws_k[:n], ws_v[:n])
+                elif self.is_packed_int4:
+                    from sglang.srt.mem_cache.int4_kv_kernels import (
+                        gather_dequant, gather_dequant_i2)
+                    kv_pool = forward_batch.token_to_kv_pool
+                    kd, ks_, kz, vd, vs_, vz = kv_pool.get_kv_int4_buffers(layer.layer_id)
+                    indices = self.cur_kv_indices
+                    n = self.cur_kv_len
+                    if self._ws_i4 is None or self._ws_i4[0].shape[0] < n:
+                        shape = (max(n, 256), self.num_kv_heads, self.head_dim)
+                        self._ws_i4 = (torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+                                       torch.empty(shape, dtype=torch.bfloat16, device="cuda"))
+                    _fn = gather_dequant_i2 if getattr(kv_pool, "is_packed_int2", False) else gather_dequant
+                    _fn(kd, ks_, kz, indices[:n], self._ws_i4[0][:n])
+                    _fn(vd, vs_, vz, indices[:n], self._ws_i4[1][:n])
+                    kv = (self._ws_i4[0][:n], self._ws_i4[1][:n])
+                elif getattr(forward_batch.token_to_kv_pool, "is_packed_tile2", False):
+                    # The ragged prefill path also reads the cached prefix through the pool; with
+                    # no bf16 pool that call indexes an empty list, so it has to go through the
+                    # same dequantising workspace as decode.
+                    kv = self._packed_kv_for_attn(layer, forward_batch)
                 else:
                     kv = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -645,6 +683,271 @@ class FlashInferAttnBackend(AttentionBackend):
                 torch.empty(0, dtype=torch.float32, device=q.device),
                 layer.scaling,
             )
+        elif (getattr(forward_batch.token_to_kv_pool, "is_packed_tile2", False)
+              and __import__("os").environ.get("SGLANG_TILE2_FUSED") == "1"):
+            # Fused decode: read the 2-bit tiles straight out of the store, exactly like the
+            # int4 path above reads its packed cache. No dense bf16 workspace is built, so the
+            # KV traffic per step is ~0.2x of bf16 instead of ~2.15x.
+            from sglang.srt.mem_cache.tile2_attn import fused_decode as _t2fused
+            from sglang.srt.mem_cache.tile2_attn import fused_decode_split as _t2split
+            _p = forward_batch.token_to_kv_pool
+            _buf = _p.tile2_buf
+            _bs = len(q)
+            _hq = layer.tp_q_head_num
+            _d = layer.head_dim
+            if getattr(self, "_t2f_cap", 0) < _bs:
+                self._t2f_cap = max(64, _bs)
+                c = self._t2f_cap
+                self._t2f_rows = torch.zeros((c,), dtype=torch.int32, device=q.device)
+                self._t2f_lens = torch.zeros((c,), dtype=torch.int32, device=q.device)
+                self._t2f_q = torch.zeros((c, _hq, _d), dtype=torch.bfloat16, device=q.device)
+                self._t2f_o = torch.zeros((c, _hq, _d), dtype=torch.bfloat16, device=q.device)
+            _f = self._t2f_cap
+            self._t2f_rows[:_bs].copy_(forward_batch.req_pool_indices.to(torch.int32))
+            # seq_lens already includes the token written in this step
+            self._t2f_lens[:_bs].copy_(forward_batch.seq_lens.to(torch.int32))
+            self._t2f_q[:_bs].copy_(q.view(_bs, _hq, _d).to(torch.bfloat16))
+            _li_f = layer.layer_id - _p.start_layer
+            _splits = int(__import__("os").environ.get("SGLANG_TILE2_SPLITS", "0"))
+            if _splits > 1:
+                # Split-K: one program per (request, kv head, split). The unsplit kernel puts only
+                # 8 requests x 8 kv heads = 64 programs on 82 SMs, so the GPU is idle while each
+                # program walks the whole context serially.
+                _need = _f * _hq * _splits
+                if getattr(self, "_t2s_cap", 0) != (_f, _splits):
+                    self._t2s_cap = (_f, _splits)
+                    self._t2s_mido = torch.zeros((_need * _d,), dtype=torch.float32, device=q.device)
+                    self._t2s_lse = torch.zeros((_need,), dtype=torch.float32, device=q.device)
+                    self._t2s_qrot = torch.zeros((_f * _hq * _d,), dtype=torch.bfloat16,
+                                                 device=q.device)
+                _ok = _t2split(_buf, _li_f, self._t2f_q[:_f], self._t2f_rows[:_f],
+                               self._t2f_lens[:_f], _buf.packed_ntiles[_li_f],
+                               self._t2f_o[:_f], layer.scaling,
+                               (self._t2s_mido, self._t2s_lse), splits=_splits,
+                               rot_fused=getattr(_buf, "rot_fused", False),
+                               qrot=self._t2s_qrot)
+            else:
+                _ok = _t2fused(_buf, _li_f, self._t2f_q[:_f],
+                               self._t2f_rows[:_f], self._t2f_lens[:_f],
+                               _buf.packed_ntiles[_li_f],
+                               self._t2f_o[:_f], layer.scaling)
+            if not _ok:
+                raise RuntimeError("[TILE2] fused decode kernel refused the shape")
+            if (__import__("os").environ.get("SGLANG_TILE2_ATTN_DBG") == "1"
+                    and int(self._t2f_lens[:_bs].max()) > int(__import__("os").environ.get("T2DBG_MIN", "200"))
+                    and (self.__dict__.setdefault("_t2f_step", 0) or True)
+                    and (self.__dict__.__setitem__("_t2f_step", self._t2f_step + 1) or True)
+                    and self._t2f_step % 128 == 64
+                    and getattr(self, "_t2f_dbg", 0) < 6):
+                self._t2f_dbg = getattr(self, "_t2f_dbg", 0) + 1
+                try:
+                    _ref = decode_wrapper.forward(
+                        q.contiguous().view(-1, _hq, _d),
+                        self._packed_kv_for_attn(layer, forward_batch),
+                        sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
+                        k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+                    ).view(_bs, _hq, _d).float()
+                    _g = self._t2f_o[:_bs].float()
+                    _rel = ((_g - _ref).pow(2).mean().sqrt()
+                            / _ref.pow(2).mean().sqrt().clamp(min=1e-9)).item()
+                    _per = (((_g - _ref).pow(2).mean(dim=(1, 2)).sqrt()
+                             / _ref.pow(2).mean(dim=(1, 2)).sqrt().clamp(min=1e-9))
+                            .tolist())
+                    # Second probe: force every tile down the packed branch. If that fixes the
+                    # error the staged branch is wrong; if it does not, the packed branch is.
+                    _li2 = layer.layer_id - _p.start_layer
+                    _forced = torch.full_like(_buf.packed_ntiles[_li2],
+                                              (_buf.slots // _buf.T) - 1)
+                    _o2 = torch.zeros_like(self._t2f_o[:_f])
+                    _t2fused(_buf, _li2, self._t2f_q[:_f], self._t2f_rows[:_f],
+                             self._t2f_lens[:_f], _forced, _o2, layer.scaling)
+                    _g2 = _o2[:_bs].float()
+                    _rel2 = ((_g2 - _ref).pow(2).mean().sqrt()
+                             / _ref.pow(2).mean().sqrt().clamp(min=1e-9)).item()
+                    print(f"[T2ATTN-ALLPACK] relRMS={_rel2:.4f}", flush=True)
+                    # Probe 3: does a torch re-implementation of the kernel's dequant formula,
+                    # using the engine's own tables, reproduce gather_dequant? This separates
+                    # "wrong formula/index" from "wrong attention".
+                    try:
+                        _li2 = layer.layer_id - _p.start_layer
+                        _r0 = int(self._t2f_rows[0])
+                        _key0 = int(_buf.key_tab[_r0])
+                        _base0 = int(_buf.base_tab[_r0])
+                        _n0 = int(self._t2f_lens[0])
+                        _pos = _n0 - 40                      # inside the last packed tile
+                        _ridx0 = int(_buf.ridx_tab[_r0])
+                        _slot = int(_buf.pos_slot[_ridx0, _pos])
+                        _ti = _pos // _buf.T
+                        _off = _pos % _buf.T
+                        _tid = _base0 + _ti
+                        _h = 0
+                        _kc = _buf.k_codes[_li2][_slot, _h]                     # [D/4] uint8
+                        _cb = _kc.to(torch.int32)
+                        _codes = torch.stack([(_cb >> (2 * i)) & 3 for i in range(4)],
+                                             dim=-1).reshape(-1).float()
+                        _ks = _buf.k_sc[_li2][_tid, _h].float()
+                        _kl = _buf.k_lo[_li2][_tid, _h].float()
+                        _ka = _buf.k_A[_li2][_tid, _h].float()
+                        _kb = float(_buf.k_B[_li2][_tid, _off, _h])
+                        _mine = ((_codes * _ks + _kl) * _ka) * _kb
+                        _kref = torch.empty((1, _buf.H, _buf.D), dtype=torch.bfloat16, device="cuda")
+                        _vref = torch.empty_like(_kref)
+                        from sglang.srt.mem_cache.tile2_store import gather_dequant as _gd
+                        _gd(_buf, _li2, torch.tensor([_slot], dtype=torch.int32, device="cuda"),
+                            _kref, _vref)
+                        _kr = _kref[0, _h].float()
+                        if _buf.unrotate:
+                            from sglang.srt.mem_cache.tile2_store import rotate_hadamard as _rh
+                            _kr = _rh(_kr)
+                        _dprobe = ((_mine - _kr).pow(2).mean().sqrt()
+                                   / _kr.pow(2).mean().sqrt().clamp(min=1e-9)).item()
+                        print(f"[T2ATTN-DEQ] pos={_pos} tid={_tid} base={_base0} "
+                              f"slot={_slot} relRMS={_dprobe:.4f} "
+                              f"mine[0:4]={_mine[:4].tolist()} ref[0:4]={_kr[:4].tolist()}",
+                              flush=True)
+                    except Exception as _e3:
+                        print(f"[T2ATTN-DEQ] failed: {_e3}", flush=True)
+                    # Third opinion: a plain torch softmax over gather_dequant, with slots taken
+                    # from req_to_token. If this agrees with the fused kernel, then the fused
+                    # kernel is right and the materialise path is the odd one out -- and vice
+                    # versa. Without this the whole comparison rests on assuming one side is
+                    # correct.
+                    try:
+                        from sglang.srt.mem_cache.tile2_store import gather_dequant as _gd3
+                        _li3 = layer.layer_id - _p.start_layer
+                        _r2t3 = forward_batch.req_to_token_pool.req_to_token
+                        _tor = torch.zeros_like(_g)
+                        for _i in range(_bs):
+                            _r3 = int(self._t2f_rows[_i])
+                            _n3 = int(self._t2f_lens[_i])
+                            _sl3 = _r2t3[_r3, :_n3].to(torch.long)
+                            _kk3 = torch.empty((_n3, _buf.H, _buf.D), dtype=torch.bfloat16, device="cuda")
+                            _vv3 = torch.empty_like(_kk3)
+                            _gd3(_buf, _li3, _sl3.to(torch.int32), _kk3, _vv3)
+                            _qt = self._t2f_q[_i].float()             # [HQ, D]
+                            _gg = _hq // _buf.H
+                            for _h3 in range(_buf.H):
+                                _kb3 = _kk3[:, _h3, :].float()
+                                _vb3 = _vv3[:, _h3, :].float()
+                                _qb3 = _qt[_h3 * _gg:(_h3 + 1) * _gg, :]
+                                _sc3 = (_qb3 @ _kb3.T) * layer.scaling
+                                _pp3 = torch.softmax(_sc3, dim=-1)
+                                _tor[_i, _h3 * _gg:(_h3 + 1) * _gg, :] = _pp3 @ _vb3
+                        def _rr(a, bb):
+                            return ((a.float() - bb.float()).pow(2).mean().sqrt()
+                                    / bb.float().pow(2).mean().sqrt().clamp(min=1e-9)).item()
+                        print(f"[T2ATTN-3WAY] fused-vs-torch={_rr(_g, _tor):.4f} "
+                              f"flashinfer-vs-torch={_rr(_ref, _tor):.4f} "
+                              f"fused-vs-flashinfer={_rr(_g, _ref):.4f}", flush=True)
+                    except Exception as _e3:
+                        print(f"[T2ATTN-3WAY] failed: {_e3}", flush=True)
+                    print(f"[T2ATTN] relRMS={_rel:.4f} per-req="
+                          f"{[round(x, 4) for x in _per]} lens={self._t2f_lens[:_bs].tolist()} "
+                          f"key={_buf.key_tab[self._t2f_rows[:_bs].long()].tolist()} "
+                          f"nc={_buf.packed_ntiles[layer.layer_id - _p.start_layer].gather(0, _buf.key_tab[self._t2f_rows[:_bs].long()].long()).tolist()}",
+                          flush=True)
+                except Exception as _e:
+                    print(f"[T2ATTN] reference failed: {_e}", flush=True)
+            o = self._t2f_o[:_bs].view(_bs, _hq * _d)
+        elif getattr(forward_batch.token_to_kv_pool, "is_packed_tile2", False):
+            # Materialise fallback: gather the visible rows into the bf16 workspace and let
+            # flashinfer attend. Slower than the fused kernel above, but it is the path that is
+            # verified end to end, and removing it (as a first version of the fused branch did)
+            # makes every non-fused run fall through to the bf16-pool branch below, which does not
+            # exist for this cache and raises IndexError on the first long prompt.
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                self._packed_kv_for_attn(layer, forward_batch),
+                sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+            )
+        elif self.is_packed_int4 and getattr(forward_batch.token_to_kv_pool, "is_packed_int2", False):
+            from sglang.srt.mem_cache.int4_kv_kernels import gather_dequant_i2
+            _p = forward_batch.token_to_kv_pool
+            _kd, _ksc, _kz, _vd, _vsc, _vz = _p.get_kv_int4_buffers(layer.layer_id)
+            _idx, _n = self.cur_kv_indices, self.cur_kv_len
+            _cur = self._ws_i4
+            if _cur is None or _cur[0].shape[0] < _n:
+                _cur = (torch.empty((max(_n, 256), self.num_kv_heads, self.head_dim),
+                                    dtype=torch.bfloat16, device="cuda"),
+                        torch.empty((max(_n, 256), self.num_kv_heads, self.head_dim),
+                                    dtype=torch.bfloat16, device="cuda"))
+                self._ws_i4 = _cur
+            if not getattr(self, "_i2_idx_logged", False) and _idx is not None and _n > 0:
+                self._i2_idx_logged = True
+                print(f"[I2-IDX] n={_n} idx={_idx[:8].tolist()} dtype={_idx.dtype} "
+                      f"max={int(_idx[:max(_n,1)].max())} head_num={self.num_kv_heads} "
+                      f"payload={_kd.shape[-1]}", flush=True)
+            gather_dequant_i2(_kd, _ksc, _kz, _idx[:_n], _cur[0][:_n])
+            gather_dequant_i2(_vd, _vsc, _vz, _idx[:_n], _cur[1][:_n])
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                (_cur[0][:_n], _cur[1][:_n]),
+                sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float, v_scale=layer.v_scale_float)
+        elif self.is_packed_int4 and self._int4_cuda_ok(forward_batch):
+            # Stage-5: tensor-core CUDA kernel reads the packed cache directly (no copy,
+            # no shadow). Validated at 1.0 bf16 ULP against the torch reference.
+            from sglang.srt.mem_cache.int4_fused import decode_int4_fused
+            if not getattr(self, "_p_cuda", False):
+                self._p_cuda = True
+                print("[PATH] cuda-fused", flush=True)
+            from sglang.srt.mem_cache import int4_fused as _f
+            _pool = forward_batch.token_to_kv_pool
+            _kd, _ksc, _kz, _vd, _vsc, _vz = _pool.get_kv_int4_buffers(layer.layer_id)
+            _bs = len(q)
+            _hq = layer.tp_q_head_num
+            o = _f.get_out(_bs, _hq, layer.head_dim, q.dtype, q.device)
+            _ns = self._i4_split_count(_bs)
+            if _ns <= 1:
+                decode_int4_fused(q.view(_bs, _hq, layer.head_dim).contiguous(),
+                                  _kd, _ksc, _kz, _vd, _vsc, _vz,
+                                  self.cur_kv_indices, self.kv_indptr[0][: _bs + 1],
+                                  o, layer.scaling)
+            else:
+                self._i4_decode_split(q.view(_bs, _hq, layer.head_dim).contiguous(),
+                                      _kd, _ksc, _kz, _vd, _vsc, _vz, o,
+                                      self.kv_indptr[0][: _bs + 1], _ns, layer.scaling,
+                                      forward_batch)
+        elif self.is_packed_int4 and self._int4_shadow_ok(forward_batch):
+            # Stage-2: the page table already points at shadow rows (built upstream), so
+            # attention reads the incrementally maintained bf16 shadow with no copy at all.
+            _pool = forward_batch.token_to_kv_pool
+            _sk, _sv, _map, _nrow, _ovf = _pool.get_int4_shadow(layer.layer_id)
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                (_sk, _sv),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        elif self.is_packed_int4:
+            if not getattr(self, "_p_ws", False):
+                self._p_ws = True
+                print("[PATH] workspace-dequant", flush=True)
+            from sglang.srt.mem_cache.int4_kv_kernels import gather_dequant
+            _pool = forward_batch.token_to_kv_pool
+            kd, ks_, kz, vd, vs_, vz = _pool.get_kv_int4_buffers(layer.layer_id)
+            idx = self.cur_kv_indices
+            nn = self.cur_kv_len
+            cur = self._ws_i4
+            if cur is None or cur[0].shape[0] < nn:
+                cur = (torch.empty((max(nn, 256), self.num_kv_heads, self.head_dim),
+                                   dtype=torch.bfloat16, device="cuda"),
+                       torch.empty((max(nn, 256), self.num_kv_heads, self.head_dim),
+                                   dtype=torch.bfloat16, device="cuda"))
+                self._ws_i4 = cur
+            gather_dequant(kd, ks_, kz, idx[:nn], cur[0][:nn])
+            gather_dequant(vd, vs_, vz, idx[:nn], cur[1][:nn])
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                (cur[0][:nn], cur[1][:nn]),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         else:
             kv = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -677,6 +980,222 @@ class FlashInferAttnBackend(AttentionBackend):
                 torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
             )
         return self._ws_kv
+
+    def _packed_kv_for_attn(self, layer, forward_batch):
+        """KV tuple for a paged attention call: the pool for bf16, a dequantised workspace for
+        the packed recipes. One helper because three call sites need the same thing."""
+        pool = forward_batch.token_to_kv_pool
+        if not (getattr(pool, "is_packed_int4", False)
+                or getattr(pool, "is_packed_tile2", False)):
+            return pool.get_kv_buffer(layer.layer_id)
+        if getattr(pool, "is_packed_tile2", False):
+            from sglang.srt.mem_cache.tile2_store import gather_dequant as _t2_gather
+            idx, n = self.cur_kv_indices, self.cur_kv_len
+            if __import__("os").environ.get("SGLANG_TILE2_SEG") == "1":
+                _st = self.__dict__.setdefault("_segchk", {"k": 0})
+                if _st["k"] < 40 and (len(forward_batch.seq_lens) >= 2 or n >= 200):
+                    _st["k"] += 1
+                    _seq = [int(x) for x in forward_batch.seq_lens.tolist()]
+                    _rows = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+                    _r2t = forward_batch.req_to_token_pool.req_to_token
+                    _ind = self.kv_indptr[0][: len(_seq) + 1].tolist()
+                    bad = []
+                    for _i, _L in enumerate(_seq):
+                        if _ind[_i + 1] - _ind[_i] != _L:
+                            bad.append(f"req{_i} segment {_ind[_i+1]-_ind[_i]} != seq_len {_L}")
+                        _got = idx[_ind[_i]:_ind[_i + 1]].to(torch.long)
+                        _want = _r2t[_rows[_i], : _L].to(torch.long)
+                        if not torch.equal(_got, _want):
+                            _nk = int((_got != _want).sum())
+                            bad.append(f"req{_i} slots differ in {_nk}/{_L} rows")
+                    print(f"[TILE2-SEG] bs={len(_seq)} n={n} indptr={_ind} "
+                          f"seq_lens={_seq} problems={bad if bad else 'none'}", flush=True)
+            cur = getattr(self, "_ws_i4", None)
+            if cur is None or cur[0].shape[0] < n:
+                # Grow geometrically. Decode adds bs tokens per step, so sizing the workspace
+                # exactly to `n` reallocated ~90 MB on almost every step for the whole of a
+                # long generation -- that alone can dominate a decode step.
+                cap = max(256, int(n * 1.5) + 64)
+                cur = (torch.empty((cap, self.num_kv_heads, self.head_dim),
+                                   dtype=torch.bfloat16, device="cuda"),
+                       torch.empty((cap, self.num_kv_heads, self.head_dim),
+                                   dtype=torch.bfloat16, device="cuda"))
+                self._ws_i4 = cur
+            buf = pool.tile2_buf
+            if __import__("os").environ.get("SGLANG_TILE2_SKIPREAD") == "1":
+                # Diagnostic: skip the gather + un-rotation entirely (output is garbage) to price
+                # the read path against the write path.
+                return (cur[0][:n], cur[1][:n])
+            if True:
+                # Gather straight into bf16 and un-rotate outside. The fp32 scratch version was
+                # 4.8x slower in the gather (1.77 vs 0.371 ms for 20.8k rows) because the Triton
+                # kernel's float32 stores are far less efficient, and it dominated the step.
+                if not getattr(self, "_t2dbg", False):
+                    self._t2dbg = True
+                    print(f"[T2FAST] unrotate={buf.unrotate} triton={getattr(buf, 'use_triton', True)} "
+                          f"n={n} layers={pool.layer_num}", flush=True)
+                from sglang.srt.mem_cache.tile2_store import gather_dequant_triton as _t2k
+                from sglang.srt.mem_cache.tile2_store import gather_dequant_torch as _t2t
+                if getattr(buf, "use_triton", True):
+                    _t2k(buf, layer.layer_id - pool.start_layer, idx[:n], cur[0][:n], cur[1][:n])
+                else:
+                    _t2t(buf, layer.layer_id - pool.start_layer, idx[:n], cur[0][:n], cur[1][:n])
+                if buf.unrotate:
+                    # Only the packed rows are in the Hadamard domain; staging holds the model's own
+                    # values, so the transform is applied to a copy and blended on a device mask.
+                    hk = buf.Hk()
+                    m = (buf.slot_row.index_select(0, idx[:n].to(torch.long)) >= 0).view(-1, 1, 1)
+                    rk = cur[0][:n].float() @ hk
+                    rv = cur[1][:n].float() @ hk
+                    cur[0][:n].copy_(torch.where(m, rk, cur[0][:n].float()).to(torch.bfloat16))
+                    cur[1][:n].copy_(torch.where(m, rv, cur[1][:n].float()).to(torch.bfloat16))
+            elif buf.unrotate:
+                # Gather in float32 and un-rotate there, so the reconstruction is rounded to bf16
+                # exactly once -- same as the in-place QDQ arm. With a bf16 scratch the value is
+                # rounded twice (in the Hadamard domain and again after the transform).
+                f32 = getattr(self, "_ws_t2f32", None)
+                if f32 is None or f32[0].shape[0] < n:
+                    f32 = (torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                                       dtype=torch.float32, device="cuda"),
+                           torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                                       dtype=torch.float32, device="cuda"))
+                    self._ws_t2f32 = f32
+                # gather_dequant un-rotates internally; giving it float32 buffers means both the
+                # reconstruction and the transform stay in float32 and the single bf16 rounding
+                # happens right here. Doing the transform again outside would un-rotate twice.
+                _t2_gather(buf, layer.layer_id - pool.start_layer,
+                           idx[:n], f32[0][:n], f32[1][:n])
+                cur[0][:n].copy_(f32[0][:n].to(torch.bfloat16))
+                cur[1][:n].copy_(f32[1][:n].to(torch.bfloat16))
+            else:
+                _t2_gather(buf, layer.layer_id - pool.start_layer,
+                           idx[:n], cur[0][:n], cur[1][:n])
+            if buf.use_slot_ws:
+                # Slot-indexed workspace: the same layout the bf16 pool has, so flashinfer can be
+                # given the real slot ids (see the indices updater guard).
+                if buf.slot_ws is None:
+                    buf.slot_ws = (
+                        torch.zeros((buf.slots, self.num_kv_heads, self.head_dim),
+                                    dtype=torch.bfloat16, device="cuda"),
+                        torch.zeros((buf.slots, self.num_kv_heads, self.head_dim),
+                                    dtype=torch.bfloat16, device="cuda"))
+                buf.slot_ws[0].index_copy_(0, idx[:n].to(torch.long), cur[0][:n])
+                buf.slot_ws[1].index_copy_(0, idx[:n].to(torch.long), cur[1][:n])
+                return (buf.slot_ws[0], buf.slot_ws[1])
+            return (cur[0][:n], cur[1][:n])
+
+        from sglang.srt.mem_cache.int4_kv_kernels import gather_dequant, gather_dequant_i2
+        kd, ksc, kz, vd, vsc, vz = pool.get_kv_int4_buffers(layer.layer_id)
+        idx, n = self.cur_kv_indices, self.cur_kv_len
+        cur = self._ws_i4
+        if cur is None or cur[0].shape[0] < n:
+            cur = (torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                               dtype=torch.bfloat16, device="cuda"),
+                   torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                               dtype=torch.bfloat16, device="cuda"))
+            self._ws_i4 = cur
+        fn = gather_dequant_i2 if getattr(pool, "is_packed_int2", False) else gather_dequant
+        fn(kd, ksc, kz, idx[:n], cur[0][:n])
+        fn(vd, vsc, vz, idx[:n], cur[1][:n])
+        return (cur[0][:n], cur[1][:n])
+
+    def _int4_cuda_ok(self, forward_batch) -> bool:
+        """Gate for the CUDA fused path; anything unexpected falls back to earlier stages."""
+        import os
+        if os.environ.get("SGLANG_INT4_CUDA") != "1":
+            return False
+        pool = forward_batch.token_to_kv_pool
+        idx = self.cur_kv_indices
+        n = self.cur_kv_len
+        # The kernel reads kv_indices[0..n) and kv_indptr[0..batch]; if those disagree the
+        # launch reads out of bounds (illegal memory access). Fall back rather than gamble.
+        if not getattr(self, "_probe_done", False):
+            _ip = self.kv_indptr[0] if self.kv_indptr is not None else None
+            print(f"[GATE] idx={None if idx is None else (idx.dtype, idx.numel())} "
+                  f"n={n} indptr={None if _ip is None else (_ip.dtype, _ip.numel())} "
+                  f"bs={getattr(forward_batch,'batch_size',None)} "
+                  f"pool_packed={getattr(pool,'is_packed_int4',None)}", flush=True)
+            self._probe_done = True
+        if idx is None or n <= 0 or idx.numel() < n:
+            print("[GATE] FAIL: idx", flush=True)
+            return False
+        indptr = self.kv_indptr[0]
+        if indptr is None or indptr.numel() < 2:
+            print("[GATE] FAIL: indptr", flush=True)
+            return False
+        return bool(getattr(pool, "is_packed_int4", False))
+
+    def _i4_split_count(self, bs: int) -> int:
+        """How many KV chunks to split each request into (1 = plain one-CTA-per-(req,head))."""
+        if not hasattr(self, "_i4_sk"):
+            import os
+            v = os.environ.get("SGLANG_INT4_SPLITK", "1")
+            self._i4_sk = 0 if v in ("", "0", "off") else (v if v == "auto" else int(v))
+            print(f"[INT4] splitk={self._i4_sk}", flush=True)
+        if self._i4_sk in (0, "0"):
+            return 1
+        if self._i4_sk == "auto":
+            # Batch only: must be identical at cuda-graph capture and at replay.
+            import sglang.srt.mem_cache.int4_splitk as _sk
+            return _sk.auto_nsplit_for_batch(bs, self.num_kv_heads)
+        return int(self._i4_sk)
+
+    def _i4_decode_split(self, q, kd, ks, kz, vd, vs, vz, o, indptr, nsplit, sm_scale,
+                         forward_batch):
+        """Chunk each request's KV into `nsplit` pieces, run them as a ragged batch, merge.
+
+        The plan depends only on the batch's indptr, so it is rebuilt once per step: the
+        identity of `forward_batch` is exactly the per-step key (a reference is kept so the
+        id cannot be recycled).
+        """
+        import sglang.srt.mem_cache.int4_splitk as _sk
+        _key = (id(forward_batch), q.shape[0])
+        if (torch.cuda.is_current_stream_capturing()
+                or getattr(self, "_i4_plan_key", None) != _key):
+            self._i4_plan_key = _key
+            self._i4_plan_fb = forward_batch     # keep alive so the id cannot be recycled
+            self._i4_plan = _sk.build_plan(indptr, nsplit)
+        return _sk.decode_split(q, kd, ks, kz, vd, vs, vz,
+                                self.cur_kv_indices, indptr, self._i4_plan, o,
+                                sm_scale, nsplit)
+
+    def _int4_shadow_ok(self, forward_batch) -> bool:
+        """Gate for the stage-2 fast path; anything unexpected falls back to stage 1."""
+        import os
+        if os.environ.get("SGLANG_INT4_SHADOW") != "1":
+            return False
+        pool = forward_batch.token_to_kv_pool
+        if pool is None or not getattr(pool, "is_packed_int4", False):
+            return False
+        if getattr(pool, "i4_overflow", True):
+            return False
+        idx = self.cur_kv_indices
+        return idx is not None and self.cur_kv_len > 0
+
+    def _int4_workspace_decode(self, q, layer, forward_batch, decode_wrapper):
+        """Verified stage-1 path: dequantise the rows this step needs."""
+        from sglang.srt.mem_cache.int4_kv_kernels import gather_dequant
+        pool = forward_batch.token_to_kv_pool
+        kd, ks_, kz, vd, vs_, vz = pool.get_kv_int4_buffers(layer.layer_id)
+        idx = self.cur_kv_indices
+        n = self.cur_kv_len
+        cur = self._ws_i4
+        if cur is None or cur[0].shape[0] < n:
+            cur = (torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                               dtype=torch.bfloat16, device="cuda"),
+                   torch.empty((max(n, 256), self.num_kv_heads, self.head_dim),
+                               dtype=torch.bfloat16, device="cuda"))
+            self._ws_i4 = cur
+        gather_dequant(kd, ks_, kz, idx[:n], cur[0][:n])
+        gather_dequant(vd, vs_, vz, idx[:n], cur[1][:n])
+        return decode_wrapper.forward(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            (cur[0][:n], cur[1][:n]),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -893,9 +1412,20 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
-        if self.attn_backend.is_mxfp4:
+        _p4 = getattr(self.attn_backend, "_kv_pool", None)
+        if (getattr(self.attn_backend, "is_packed_int4", False) and _p4 is not None
+                and __import__("os").environ.get("SGLANG_INT4_SHADOW") == "1"
+                and not getattr(_p4, "i4_overflow", True)):
+            # stage-2: workspace rows ARE shadow rows -> map slots once per step here
+            plan_kv_indices = _p4.i4_slot2row[kv_indices.long()].to(kv_indices.dtype)
+        elif (self.attn_backend.is_mxfp4
+                or getattr(self.attn_backend, "is_packed_int4", False)
+                or (getattr(self.attn_backend, "is_packed_tile2", False)
+                    and __import__("os").environ.get("SGLANG_TILE2_SLOTWS") != "1")):
+
             # Workspace rows are compacted 0..n-1; flashinfer must index them
-            # by compact ids, not global slot ids.
+            # by compact ids, not global slot ids. With the slot-indexed workspace the rows are
+            # addressed by real slot id instead, so the substitution must NOT happen here either.
             plan_kv_indices = self.attn_backend._get_compact_indices(
                 paged_kernel_lens_sum
             )
@@ -1167,9 +1697,15 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
-        if self.attn_backend.is_mxfp4:
+        # Diagnostic switch; the env var is the single source of truth so both the updater and
+        # the read path agree without plumbing a pool handle through here.
+        _slotws = __import__("os").environ.get("SGLANG_TILE2_SLOTWS") == "1"
+        if (self.attn_backend.is_mxfp4
+                or getattr(self.attn_backend, "is_packed_int4", False)
+                or (getattr(self.attn_backend, "is_packed_tile2", False) and not _slotws)):
             # Workspace rows are compacted 0..n-1; flashinfer must index them
-            # by compact ids, not global slot ids.
+            # by compact ids, not global slot ids. Missing this in the prefill updater is
+            # silent: attention reads slot-id rows out of a compact workspace.
             plan_kv_indices = self.attn_backend._get_compact_indices(
                 paged_kernel_lens_sum
             )
