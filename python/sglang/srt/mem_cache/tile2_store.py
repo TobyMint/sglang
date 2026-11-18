@@ -1566,7 +1566,8 @@ def install(pool) -> None:
             drv = pool.tile2_drv
             idx = self.req_pool_indices
             _dbg = os.environ.get("SGLANG_TILE2_KEYDBG") == "1"
-            print("[T2HOOK-CALL] reqs=%d" % len(self.reqs), flush=True)
+            if _dbg:
+                print("[T2HOOK-CALL] reqs=%d" % len(self.reqs), flush=True)
             for i, req in enumerate(self.reqs):
                 _row = int(idx[i])
                 _new = drv.note_request(_row, req.rid)
@@ -1576,7 +1577,8 @@ def install(pool) -> None:
             return _orig_gmwb(self, *a, **kw)
         _gmwb._tile2_bound = True
         ScheduleBatch.get_model_worker_batch = _gmwb
-        print("[T2HOOK] ScheduleBatch.get_model_worker_batch patched", flush=True)
+        if os.environ.get("SGLANG_TILE2_KEYDBG") == "1":
+            print("[T2HOOK] ScheduleBatch.get_model_worker_batch patched", flush=True)
 
     def bracket(fn):
         def inner(self, q, k, v, layer, forward_batch, save_kv_cache=True):
