@@ -876,6 +876,18 @@ def gather_dequant_torch(buf: Tile2Buffers, li: int, idx: torch.Tensor,
                   flush=True)
 
 
+#: Actually freeing a request's landing-window slot and tile block looks obviously right, and it
+#: is -- except that `flush_deferred` records liveness under `_row_key.get(row, row)`, so a row
+#: whose mapping is absent poisons the liveness map with a ROW number. Once frees really happen,
+#: live requests then look stale and their slots are handed to someone else, and because the read
+#: path serves the *newest* tokens out of the landing window, that corrupts exactly the tokens
+#: that matter most: n=200 accuracy fell 71.5% -> 38.0% with truncation 31.5% -> 63.0%.
+#: So the translating (effectively no-op) path stays the default until the liveness map is keyed
+#: consistently; set SGLANG_TILE2_FREE_RELEASE=1 to exercise the correct behaviour.
+def _free_release() -> bool:
+    return os.environ.get("SGLANG_TILE2_FREE_RELEASE") == "1"
+
+
 def _write_ranges(fb, nreq):
     """(positions already written, rows written now) per batch row.
 
@@ -1004,6 +1016,11 @@ class Tile2Driver:
         are in use") or another LIVE request's slot was handed out from under it. Both were
         silent; the second one is corruption. `_row_key` is now only read for row -> key lookups.
         """
+        if not _free_release():
+            # Historical behaviour, and deliberately the default: translate the argument through
+            # `_row_key` as if it were a req_to_token ROW. That is wrong (see the docstring) and it
+            # is also *load bearing* -- see the note above `_free_release`.
+            key = self._row_key.pop(key, key)
         if _AUDIT:
             self._released[key] = self.steps
         if key in self._lru:
@@ -1019,12 +1036,13 @@ class Tile2Driver:
             print(f"[TILE2-ARGH] release(key={key}) found no staging slot", flush=True)
         self._len.pop(key, None)
         self._last_seen.pop(key, None)
-        # `ridx_of` used to grow without bound; past REQ_SLOTS it wraps and two live requests can
-        # share a `pos_slot` row, which is silent cross-talk. Free it with the rest.
-        self._ridx.pop(key, None)
-        for r, kk in list(self._row_key.items()):
-            if kk == key:
-                self._row_key.pop(r, None)
+        if _free_release():
+            # `ridx_of` used to grow without bound; past REQ_SLOTS it wraps and two live requests
+            # can share a `pos_slot` row, which is silent cross-talk. Free it with the rest.
+            self._ridx.pop(key, None)
+            for r, kk in list(self._row_key.items()):
+                if kk == key:
+                    self._row_key.pop(r, None)
 
     def _ensure_pos_slot(self, fb) -> None:
         b = self.buf

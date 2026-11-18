@@ -274,6 +274,10 @@ def main():
     d6._row_key[3] = 2580                    # row 3 owns key 2580
     d6._row_key[0] = 999                     # row 0 owns key 999
     free_before = len(b6._staging_free)
+    # The correct behaviour is opt-in: freeing is load bearing on a liveness map that is still
+    # keyed inconsistently, so the default stays inert (see the note above _free_release in
+    # tile2_store.py). Set the switch for the duration of this check.
+    os.environ["SGLANG_TILE2_FREE_RELEASE"] = "1"
     d6.release(2580)                         # release the KEY, not a row
     assert len(b6._staging_free) == free_before + 1, "release(key) freed no staging slot"
     assert 2580 not in d6._stg and 2580 not in d6._blk, "release(key) left the key allocated"
@@ -291,6 +295,7 @@ def main():
     assert 4242 in d6._stg and 4242 in d6._blk, (
         "release(key=7) freed LIVE key 4242: it treated the key as a req_to_token row")
     assert d6._row_key.get(7) == 4242, "release() dropped a live row's key mapping"
+    os.environ.pop("SGLANG_TILE2_FREE_RELEASE", None)
     print("P6 release     key/row namespace: release(key=2580) freed its slot; colliding "
           "release(key=7) freed key 7 only, live key 4242 intact (free %d->%d)"
           % (n_before, len(b6._staging_free)))
