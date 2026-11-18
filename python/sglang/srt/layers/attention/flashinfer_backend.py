@@ -504,6 +504,15 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if __import__("os").environ.get("SGLANG_TILE2_EXTDBG") == "1":
+            _pl = getattr(forward_batch, "extend_prefix_lens", None)
+            _pv = None if _pl is None else [int(x) for x in _pl.tolist()]
+            if _pv is not None and any(v > 0 for v in _pv):
+                print(f"[T2EXT] prefix={_pv} seq={[int(x) for x in forward_batch.seq_lens.tolist()]} "
+                      f"extend_lens={[int(x) for x in forward_batch.extend_seq_lens.tolist()]} "
+                      f"use_ragged={self.forward_metadata.use_ragged} "
+                      f"extend_no_prefix={getattr(self.forward_metadata, 'extend_no_prefix', None)} "
+                      f"kv_len={self.cur_kv_len}", flush=True)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -991,6 +1000,15 @@ class FlashInferAttnBackend(AttentionBackend):
         if getattr(pool, "is_packed_tile2", False):
             from sglang.srt.mem_cache.tile2_store import gather_dequant as _t2_gather
             idx, n = self.cur_kv_indices, self.cur_kv_len
+            if __import__("os").environ.get("SGLANG_TILE2_SEGDBG") == "1":
+                _pl = getattr(forward_batch, "extend_prefix_lens", None)
+                if _pl is not None:
+                    _pv = [int(x) for x in _pl.tolist()]
+                    if any(v > 0 for v in _pv):
+                        _sl = [int(x) for x in forward_batch.seq_lens.tolist()]
+                        print(f"[T2EXT] n(kv_indices)={n} sum_seq={sum(_sl)} seq={_sl} "
+                              f"prefix={_pv} extend_lens="
+                              f"{[int(x) for x in forward_batch.extend_seq_lens.tolist()]}", flush=True)
             if __import__("os").environ.get("SGLANG_TILE2_SEG") == "1":
                 _st = self.__dict__.setdefault("_segchk", {"k": 0})
                 if _st["k"] < 40 and (len(forward_batch.seq_lens) >= 2 or n >= 200):

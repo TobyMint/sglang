@@ -1074,6 +1074,36 @@ class Tile2Driver:
         self._row_rid[row] = known
         return first
 
+    def fill_prefix_slots(self, key: int, slots: torch.Tensor) -> None:
+        """Publish a request's INHERITED prefix slots into its position table.
+
+        Runs from the scheduler hook, i.e. before every forward, so it also covers the case that
+        broke this feature for a whole afternoon: when the radix cache matches the ENTIRE prompt
+        the request has nothing left to prefill, so `set_kv_buffer` is never called, the write path
+        never runs, and the position table therefore stayed empty. Decode then found `-1` for every
+        prefix position and masked the whole history out of attention -- coherent but context-free
+        output, measured as 20 pp on n=200 (0.500 vs 0.698 with the cache off).
+        """
+        b = self.buf
+        if b.pos_slot is None:
+            # The table is normally created lazily by the write path, but a fully-cached request
+            # never reaches it -- so the hook has to be able to create it too. Capture runs before
+            # any request, so in graph mode the table already exists by the time a real batch is
+            # handed to us; this branch is what makes the non-graph / first-request case work.
+            _r2t = getattr(b, "req_to_token", None)
+            if _r2t is None:
+                return
+            b.pos_slot = torch.full((REQ_SLOTS, _r2t.shape[1]), -1,
+                                    dtype=torch.int32, device=b.device)
+        if slots is None or slots.numel() == 0:
+            return
+        n = min(int(slots.numel()), int(b.pos_slot.shape[1]))
+        _ri = self.ridx_of(int(key))
+        b.pos_slot[_ri, :n] = slots[:n].to(torch.int32)
+        if os.environ.get("SGLANG_TILE2_EXTDBG") == "1":
+            print(f"[T2FILL] key={int(key)} ridx={_ri} n={n} first={int(slots[0])} "
+                  f"last={int(slots[n-1])}", flush=True)
+
     def key_of_row(self, row: int, fallback=None) -> int:
         """Stable per-request key for this row, else `fallback` (or the union of both worlds)."""
         k = self._row_rid.get(row)
@@ -1451,6 +1481,13 @@ class Tile2Driver:
                     buf_pos = self.buf.pos_slot
                     buf_pos[_ri, :_np] = _src
                     if os.environ.get("SGLANG_TILE2_PFXDBG") == "1":
+                        _sr = self.buf.slot_row.index_select(0, _src.to(torch.long))
+                        _packed = int((_sr >= 0).sum())
+                        _staged = int(((_sr <= -2)).sum())
+                        _unwritten = int((_sr == -1).sum())
+                        print(f"[T2PFXSTATE] prefix={_np} packed={_packed} staged={_staged} "
+                              f"unwritten={_unwritten}", flush=True)
+                    if os.environ.get("SGLANG_TILE2_PFXDBG") == "1":
                         _pk = (self.buf.slot_row.index_select(0, _src.to(torch.long)) >= 0)
                         print(f"[T2PFX] ridx={_ri} prefix={_np} packed_frac=%.3f slot0=%d"
                               % (float(_pk.float().mean()), int(_src[0])), flush=True)
@@ -1631,6 +1668,15 @@ def install(pool) -> None:
             for i, req in enumerate(self.reqs):
                 _row = int(idx[i])
                 _new = drv.note_request(_row, req.rid)
+                # Publish the inherited prefix BEFORE the forward: a fully-cached request never
+                # writes, so the write path cannot do this for it.
+                try:
+                    _pi = getattr(req, "prefix_indices", None)
+                    if _pi is not None and _pi.numel() > 0:
+                        drv.fill_prefix_slots(drv._row_rid[_row], _pi)
+                except Exception as _e:
+                    if _dbg:
+                        print(f"[T2PREFIX-FAIL] {type(_e).__name__}: {_e}", flush=True)
                 if _dbg:
                     print(f"[T2KEY] row={_row} rid={req.rid} key={drv._row_rid[_row]} "
                           f"first_seen={_new}", flush=True)
