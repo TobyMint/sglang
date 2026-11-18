@@ -885,7 +885,9 @@ def gather_dequant_torch(buf: Tile2Buffers, li: int, idx: torch.Tensor,
 #: So the translating (effectively no-op) path stays the default until the liveness map is keyed
 #: consistently; set SGLANG_TILE2_FREE_RELEASE=1 to exercise the correct behaviour.
 def _free_release() -> bool:
-    return os.environ.get("SGLANG_TILE2_FREE_RELEASE") == "1"
+    # Default ON now that liveness is recorded in the request-key namespace (see flush_deferred).
+    # SGLANG_TILE2_FREE_RELEASE=0 restores the old, effectively no-op behaviour.
+    return os.environ.get("SGLANG_TILE2_FREE_RELEASE", "1") != "0"
 
 
 def _write_ranges(fb, nreq):
@@ -1186,9 +1188,18 @@ class Tile2Driver:
         if b.key_tab is not None:
             for r in rows_now:
                 self._row_key[r] = int(b.key_tab[r])
-        self._active = {self._row_key.get(r, r) for r in rows_now}
+        # Liveness must live in the SAME namespace the allocator uses (the stable request key).
+        # The old fallback `_row_key.get(r, r)` wrote a ROW number into the key namespace whenever
+        # a row had no mapping, and rows/keys overlap numerically (rows 0..~4096, keys are slot
+        # ids from 0 up). Those phantom entries never match a real key, so live requests looked
+        # stale and their landing-window slots -- which hold the NEWEST tokens -- were handed to
+        # the next request. A row with no published key is not a request we can name, so skip it.
+        self._active = set()
         for r in rows_now:
-            kk = self._row_key.get(r, r)
+            kk = self._row_key.get(r)
+            if kk is None:
+                continue
+            self._active.add(kk)
             self._last_seen[kk] = self.steps
             if kk in self._lru:
                 self._lru.remove(kk)
