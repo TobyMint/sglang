@@ -572,6 +572,16 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                 print(f"[TILE2-ARGH] staging mismatch at flush: {nbad}/{len(hit)} rows "
                       f"worse than 5% (worst {float(bad.max()):.3f}) layer={li}", flush=True)
     parts = quantise_tile(kq_, vq_, mask, bits=buf.bits, iters=_ITERS)
+    if os.environ.get("SGLANG_TILE2_QERR") == "1" and li == 0 and (int(tile) % 20 == 0):
+        # Homogeneity of the rows that went into this tile's per-channel statistics. If a tile
+        # mixes rows from different requests (or from different staging leases), the token-axis
+        # statistics are computed over unrelated data, the quantiser loses far more than it should,
+        # and the model degrades without any addressing error. `cv` = coefficient of variation of
+        # the per-row norms; a clean tile is one chunk of one request.
+        _n = kq_.float().norm(dim=(1, 2))[:int(n_valid)]
+        _cv = float(_n.std() / (_n.mean() + 1e-9))
+        print(f"[T2Q] tile={int(tile)} rows={int(n_valid)} row_norm_cv={_cv:.4f} "
+              f"k_sc_absmean={float(parts['k_sc'].abs().mean()):.5f}", flush=True)
     if _AUDIT and li == 0 and len(buf.audit) == 1:
         print(f"[TILE2-VARN] iters={_ITERS} "
               f"k_A rng=[{parts['k_A'].min().item():.3g},{parts['k_A'].max().item():.3g}] "
