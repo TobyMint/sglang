@@ -504,9 +504,31 @@ def _ramp(buf, n: int) -> torch.Tensor:
     return r
 
 
+def own_rows_mask(buf: Tile2Buffers, key: int, ti: int, slots: torch.Tensor) -> torch.Tensor:
+    """Which of this tile's rows does THIS request own?
+
+    With the radix cache a request inherits packed slots for a shared prefix and never wrote those
+    positions, so its landing-window rows there hold another request's bytes. Packing them would
+    (a) compute the tile's per-channel statistics from garbage and (b) repoint the sharer's
+    `slot_row` at this tile, so the sharer would decode its own prefix with these parameters.
+
+    A row is ours iff its slot is not packed yet (`slot_row < 0` covers both "never written" and
+    the staged encoding). The answer is CACHED per (request, tile index) because `slot_row` is
+    shared by all layers and layer 0 flips it to "packed": recomputing for layers 1..35 would
+    report "nothing is ours" and silently drop the whole tile.
+    """
+    cache = buf.__dict__.setdefault("_own_cache", {})
+    ck = (key, int(ti))
+    om = cache.get(ck)
+    if om is None:
+        om = buf.slot_row.index_select(0, slots.to(torch.long)) < 0
+        cache[ck] = om
+    return om
+
+
 def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
-               req_row: int = -1, key: int = -1) -> None:
+               req_row: int = -1, key: int = -1, own_mask=None) -> None:
     """Move one open staging tile in layer `li` into the packed region.
 
     The staging rows are contiguous (rows are appended in position order), so there is no gather
@@ -521,6 +543,10 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
     v = buf.staging_v[li, base:base + n_valid]
     mask = torch.zeros(buf.T, dtype=torch.bool, device=buf.device)
     mask[:n_valid] = True
+    if own_mask is not None:
+        mask[:own_mask.numel()] &= own_mask
+        if not bool(mask.any()):
+            return
     if n_valid < buf.T:                       # pad with zeros; the mask keeps them out of the stats
         pad = buf.T - n_valid
         k = torch.cat([k, torch.zeros(pad, buf.H, buf.D, dtype=k.dtype, device=k.device)], 0)
@@ -564,13 +590,20 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                   f"slots[0]={int(slots[0])} slots[-1]={int(slots[-1])}", flush=True)
         else:
             buf._param_owner[key] = buf._cur_row
-    buf.k_codes[li].index_copy_(0, slots, parts["codes_k"])
-    buf.v_codes[li].index_copy_(0, slots, parts["codes_v"])
+    if bool(mask.all()):
+        buf.k_codes[li].index_copy_(0, slots, parts["codes_k"])
+        buf.v_codes[li].index_copy_(0, slots, parts["codes_v"])
+    else:
+        buf.k_codes[li].index_copy_(0, slots[mask], parts["codes_k"][mask])
+        buf.v_codes[li].index_copy_(0, slots[mask], parts["codes_v"][mask])
     for name in buf.PARAM_SHAPES:
         getattr(buf, name)[li, tile] = parts[name]
     if update_map:
         off = torch.arange(buf.T, dtype=torch.int32, device=buf.device)
-        buf.slot_row.index_copy_(0, slots, (tile * buf.T + off))
+        if bool(mask.all()):
+            buf.slot_row.index_copy_(0, slots, (tile * buf.T + off))
+        else:
+            buf.slot_row.index_copy_(0, slots[mask], (tile * buf.T + off)[mask])
     if buf.packed_ntiles is not None and key is not None:
         # Only now, with the codes and all eight planes written, may the fused kernel treat this
         # tile as readable from codes. Incrementing before the writes would let a decode step read
@@ -791,8 +824,13 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                         print(f"[TILE2-ARGH] tile {_ti} key={key} li={li}: {nd}/{buf.T} slots "
                               f"in the map do not match the staged encoding "
                               f"(map[0]={int(cur[0])} want[0]={int(want[0])})", flush=True)
+                _own = own_rows_mask(buf, key, _ti, slots)
+                if not bool(_own.any()):
+                    fill = 0          # fully inherited tile: nothing of ours to pack
+                    continue
                 flush_tile(buf, li, stg, buf.T, tile_of(key, _ti), slots, update_map,
-                           count_tokens=(li == buf.start_layer), req_row=row, key=key)
+                           count_tokens=(li == buf.start_layer), req_row=row, key=key,
+                           own_mask=_own)
                 fill = 0
         start = end
 
@@ -1075,7 +1113,12 @@ class Tile2Driver:
         if key in self._lru:
             self._lru.remove(key)
         base = self._blk.pop(key, None)
-        if base is not None:
+        if base is not None and os.environ.get("SGLANG_TILE2_KEEP_TILES") != "1":
+            # With the radix cache this request's tiles may still be referenced by another request
+            # that shares its prefix, so returning them to the free list lets the next request
+            # overwrite parameters the sharer is decoding with. Correct lifetime is "when the last
+            # slot pointing at the tile is evicted"; until that is wired, KEEP_TILES=1 isolates the
+            # effect by never recycling tiles.
             self.buf.free_tile_block(base, self.buf.tiles_per_req)
         self._pending.pop(key, None)
         s = self._stg.pop(key, None)
@@ -1220,6 +1263,8 @@ class Tile2Driver:
     def flush_deferred(self, fb) -> None:
         """Quantise every tile that a decode step closed. Runs OUTSIDE the captured graph."""
         b = self.buf
+        # Ownership masks are per step: `slot_row` flips to "packed" as layer 0 writes it.
+        b.__dict__.pop("_own_cache", None)
         if b.closed is None:
             return
         seq = [int(x) for x in fb.seq_lens.tolist()]
@@ -1276,9 +1321,13 @@ class Tile2Driver:
                 if base < 0:
                     continue
                 stg = int(b.stg_tab[r])
+                _key = int(self._row_key.get(int(r), -1))
+                _own = own_rows_mask(b, _key, pre // T, slots)
+                if not bool(_own.any()):
+                    continue
                 flush_tile(b, li, stg, T, base + pre // T, slots, True,
                            count_tokens=(li == b.start_layer), req_row=int(r),
-                           key=int(self._row_key.get(int(r), -1)))
+                           key=_key, own_mask=_own)
             col.fill_(-1)
             if b.closed_mask is not None:
                 b.closed_mask[li].fill_(False)
@@ -1308,6 +1357,32 @@ class Tile2Driver:
             for r_, k_ in zip(rows, keys):
                 self._row_key[r_] = k_
             self._ensure_pos_slot(fb)
+            # Inherited prefix: when the radix cache hands a request slots it never wrote, this
+            # request's write path never sees those positions, so its per-request position table
+            # would stay -1 there and the fused kernel would MASK THE WHOLE PREFIX OUT of
+            # attention (it reads slots from `pos_slot`, not from req_to_token, because a chunked
+            # prefill changes req_to_token rows). Copy the inherited range in once, from the row
+            # that still holds it, on the request's first step.
+            if getattr(fb, "extend_prefix_lens_cpu", None) is not None:
+                _pre_lens = fb.extend_prefix_lens_cpu
+                for _i, (r_, k_) in enumerate(zip(rows, keys)):
+                    _np = int(_pre_lens[_i]) if _i < len(_pre_lens) else 0
+                    if _np <= 0:
+                        continue
+                    _ri = self.ridx_of(int(k_))
+                    _src = r2t[int(r_), :_np].to(torch.int32)
+                    if int(_src.numel()) < _np:
+                        continue
+                    buf_pos = self.buf.pos_slot
+                    buf_pos[_ri, :_np] = _src
+                    if os.environ.get("SGLANG_TILE2_PFXDBG") == "1":
+                        _pk = (self.buf.slot_row.index_select(0, _src.to(torch.long)) >= 0)
+                        print(f"[T2PFX] ridx={_ri} prefix={_np} packed_frac=%.3f slot0=%d"
+                              % (float(_pk.float().mean()), int(_src[0])), flush=True)
+                    if os.environ.get("SGLANG_TILE2_PFXDBG") == "1":
+                        print(f"[T2PFX] key={int(k_)} ridx={_ri} prefix={_np} "
+                              f"copied_slots0={int(_src[0])} copied_slots_last={int(_src[-1])}",
+                              flush=True)
             pre, nw = _write_ranges(fb, len(rows))
             # Publish the batch BEFORE allocating slots. `staging_of` refuses to evict a request
             # that is in the current batch, and the check used to read the PREVIOUS step's batch:

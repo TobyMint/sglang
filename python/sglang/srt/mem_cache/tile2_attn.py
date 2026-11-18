@@ -113,7 +113,17 @@ def _tile2_fused_decode_kernel(
 
     ntiles = (n + T - 1) // T
     for ti in range(0, ntiles):
-        packed = ti < nc
+        # NOT `ti < nc`: with the radix cache a request inherits packed tiles from whoever wrote
+        # the shared prefix and never flushes them, so its own `packed_ntiles` count stays at 0
+        # while the whole prefix is packed -- reading it from the landing window returns another
+        # request's bytes. Ask the store's routing table about the tile's first row instead; the
+        # packed branch below already falls back PER ROW to the landing window for any slot that
+        # is still staged, so one probe per tile is enough even for a mixed tile.
+        _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
+        _pos0 = ti * T
+        _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
+        _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
+        packed = _sr0 >= 0
 
         for c0 in range(0, T, BN):
             c = c0 + tl.arange(0, BN)
