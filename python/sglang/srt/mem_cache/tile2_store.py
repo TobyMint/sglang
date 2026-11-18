@@ -955,6 +955,42 @@ class Tile2Driver:
         self._row_key = {}
         self._active = set()
         self._pending = {}
+        #: request-pool row -> STABLE per-request id (see note_request). The identity used to be
+        #: the slot of position 0: stable across the row change that chunked prefill causes, but
+        #: NOT unique once the radix cache shares a prefix -- every request reusing that prefix
+        #: got the same key, so `_stg`/`_tile`/`pos_slot`/`packed_ntiles` aliased across live
+        #: requests and decode read a neighbour's KV (measured: n=20 accuracy 0.00, all truncated,
+        #: vs 0.70 with the cache off; a trace showed three concurrent requests with the same key
+        #: AND the same staging slot). A row is unique but not stable. `Request.rid` is both.
+        self._row_rid: dict = {}
+        self._rid_by_req: dict = {}
+        self._rid_next = 0
+
+    # -- request identity ---------------------------------------------------
+    def note_request(self, row: int, rid) -> None:
+        """Bind a request-pool row to a stable per-request id. Called from the scheduler hook.
+
+        Only `ScheduleBatch` sees `Request.rid` next to `req_pool_indices`, and it does so on the
+        host before the batch is handed to the model, so this is both the cheapest and the only
+        place where the two can be joined.
+        """
+        known = self._rid_by_req.get(rid)
+        if known is None:
+            known = self._rid_next
+            self._rid_next += 1
+            self._rid_by_req[rid] = known
+        self._row_rid[row] = known
+
+    def key_of_row(self, row: int, fallback=None) -> int:
+        """Stable per-request key for this row, else `fallback` (or the union of both worlds)."""
+        k = self._row_rid.get(row)
+        if k is not None:
+            return k
+        if fallback is not None:
+            return fallback
+        # Rows the scheduler hook has not described are capture-time synthetic batches; they never
+        # flush, so a per-row private namespace is enough to keep them from aliasing a real key.
+        return -(row + 1)
 
     # -- allocation ---------------------------------------------------------
     def tile_of(self, key: int, ti: int) -> int:
@@ -1265,7 +1301,10 @@ class Tile2Driver:
             rows_t = fb.req_pool_indices.to(torch.long)
             r2t = fb.req_to_token_pool.req_to_token
             rows = rows_t.tolist()
-            keys = r2t.index_select(0, rows_t)[:, 0].tolist()
+            # NOT `req_to_token[row, 0]` any more: with a shared prefix that slot is common to
+            # every request that reuses the prefix. See the `_row_rid` note above.
+            _slot0 = r2t.index_select(0, rows_t)[:, 0].tolist()
+            keys = [self.key_of_row(r, fallback=int(s0)) for r, s0 in zip(rows, _slot0)]
             for r_, k_ in zip(rows, keys):
                 self._row_key[r_] = k_
             self._ensure_pos_slot(fb)
@@ -1425,6 +1464,25 @@ def install(pool) -> None:
         return
     from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+    # `ScheduleBatch` is the only place where `Request.rid` sits next to `req_pool_indices`, and it
+    # runs on the host before every forward (never captured), so it is where the row -> request
+    # binding is stamped. Without it the store has no identity that is both unique and stable.
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+    _orig_gmwb = getattr(ScheduleBatch, "get_model_worker_batch", None)
+    if _orig_gmwb is not None and not getattr(_orig_gmwb, "_tile2_bound", False):
+        def _gmwb(self, *a, **kw):
+            try:
+                drv = pool.tile2_drv
+                idx = self.req_pool_indices
+                for i, req in enumerate(self.reqs):
+                    drv.note_request(int(idx[i]), req.rid)
+            except Exception:
+                pass
+            return _orig_gmwb(self, *a, **kw)
+        _gmwb._tile2_bound = True
+        ScheduleBatch.get_model_worker_batch = _gmwb
 
     def bracket(fn):
         def inner(self, q, k, v, layer, forward_batch, save_kv_cache=True):

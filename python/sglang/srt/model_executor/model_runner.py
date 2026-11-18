@@ -1324,7 +1324,12 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "packed_tile2":
             # Decide the three coupled numbers BEFORE profiling: the profiler subtracts the
             # landing window from the budget, and max_num_reqs is what the scheduler will see.
-            if not self.server_args.disable_radix_cache:
+            if (not self.server_args.disable_radix_cache
+                    and __import__("os").environ.get("SGLANG_TILE2_ALLOW_RADIX") != "1"):
+                # Escape hatch for the compatibility experiment only: with radix cache on, one KV
+                # slot can be shared by several requests, and this store's tile ownership assumes
+                # one owner per tile. Set SGLANG_TILE2_ALLOW_RADIX=1 to measure what actually
+                # happens instead of guessing.
                 raise ValueError(
                     "packed_tile2 does not support the radix cache: a shared prefix is packed "
                     "once and then read by later requests, while tile ownership and "
