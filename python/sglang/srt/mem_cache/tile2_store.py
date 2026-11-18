@@ -347,6 +347,12 @@ class Tile2Buffers:
         # tests) the floor matters, on a real pool _want is the binding term.
         self.tiles_per_req = max(1, min(_want, max(1, self.n_tiles // 2)))
         self._blocks = [(0, self.n_tiles)]
+        #: Blocks whose request is gone but which are still referenced by SOME slot: with the radix
+        #: cache a shared prefix keeps pointing at another request's tiles after that request
+        #: finishes, so returning the block to the free list lets the next request overwrite
+        #: parameters a live request is decoding with. Measured at n=50: never recycling tiles is
+        #: 0.660, recycling them at n=200 collapses to 0.085.
+        self._deferred_blocks = []
         self._live = set()
         self.start_layer = 0
         self._param_owner = {}
@@ -380,8 +386,16 @@ class Tile2Buffers:
                 if _AUDIT:
                     self._assert_blocks_disjoint()
                 return start
+        self.retry_deferred_blocks()
+        for i, (start, size) in enumerate(self._blocks):
+            if size >= k:
+                self._blocks[i:i + 1] = ([(start + k, size - k)] if size > k else [])
+                if _AUDIT:
+                    self._assert_blocks_disjoint()
+                return start
         raise RuntimeError(
-            f"[TILE2] no free block of {k} tiles ({len(self._blocks)} blocks left); with "
+            f"[TILE2] no free block of {k} tiles ({len(self._blocks)} blocks left, "
+            f"{len(self._deferred_blocks)} deferred); with "
             f"{self.n_tiles} tiles and {k} per request the pool supports "
             f"{self.n_tiles // k} concurrent requests")
 
@@ -398,6 +412,30 @@ class Tile2Buffers:
                 return
             prev_end = start + size
 
+    def _block_referenced(self, start: int, k: int) -> bool:
+        """Is any slot still routing into tiles [start, start+k)?
+
+        `slot_row` holds `tile*T + offset` for every packed slot, so the tile range maps to the
+        value range [start*T, (start+k)*T). One vectorised compare over the table (a few MB) is far
+        cheaper than the corruption it prevents, and it runs only when a request ends.
+        """
+        lo, hi = start * self.T, (start + k) * self.T
+        sr = self.slot_row
+        return bool(((sr >= lo) & (sr < hi)).any())
+
+    def retry_deferred_blocks(self) -> None:
+        if not self._deferred_blocks:
+            return
+        still = []
+        for start, k in self._deferred_blocks:
+            if self._block_referenced(start, k):
+                still.append((start, k))
+            else:
+                self._blocks.append((start, k))
+        self._deferred_blocks = still
+        if self._blocks or not self._deferred_blocks:
+            self._blocks.sort()
+
     def free_tile_block(self, start: int, k: int) -> None:
         # Drop the per-tile ownership records for this range. The old version left them in place,
         # so "this tile's parameters were written twice" fired on every legitimate recycle and the
@@ -405,8 +443,13 @@ class Tile2Buffers:
         lo, hi = start, start + k
         for key in [t for t in self._param_owner if lo <= t[1] < hi]:
             del self._param_owner[key]
-        self._blocks.append((start, k))
-        self._blocks.sort()
+        if self._block_referenced(start, k):
+            # Someone still reads through these tiles (a shared prefix). Keep the block out of the
+            # free list until the last reference is gone; `alloc_tile_block` retries the queue.
+            self._deferred_blocks.append((start, k))
+        else:
+            self._blocks.append((start, k))
+            self._blocks.sort()
 
     def alloc_tile(self) -> int:
         if not self._tiles_free:
