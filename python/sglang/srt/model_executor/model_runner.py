@@ -1331,27 +1331,36 @@ class ModelRunner:
                     "packed_ntiles assume one owner per tile, so results would be silently "
                     "wrong. Add --disable-radix-cache.")
             _n = self.server_args.tile2_concurrency
-            if _n is None:
-                _n = int(max_num_reqs) if max_num_reqs is not None else 8
+            if _n is None and max_num_reqs is None:
+                # OPT-IN ONLY. Deriving a concurrency when the user said nothing looked tidy, but
+                # it silently changed the shipped configuration -- staging moved from the 24 the
+                # scripts set to N+2, which is far too tight for a long evaluation: a batch of N
+                # fresh requests arrives while the previous N still hold their slots, and the
+                # reclaimer may not take a slot touched in the last 32 steps. Measured consequence:
+                # "all 10 staging slots belong to requests in the current batch" five problems in.
+                _n = None
+            elif _n is None:
+                _n = int(max_num_reqs)
             elif max_num_reqs is not None and int(max_num_reqs) != _n:
                 raise ValueError(
                     "--tile2-concurrency %d conflicts with --max-running-requests %s; "
                     "for packed_tile2 they must agree (one landing-window slot per request)"
                     % (_n, max_num_reqs))
-            self._tile2_concurrency = _n
-            # +2: warmup rows and the hand-off between a finished request and its successor
-            # reach the reclaimer before their pool row is torn down.
-            self._tile2_staging = _n + 2
-            max_num_reqs = _n
-            self.server_args.max_running_requests = _n
-            __import__("os").environ["SGLANG_TILE2_STAGING"] = str(self._tile2_staging)
-            if not self.server_args.disable_cuda_graph:
-                _cur = self.server_args.cuda_graph_max_bs or 0
-                if _cur < _n:
-                    logger.warning(
-                        "packed_tile2: raising cuda_graph_max_bs %s -> %s so that concurrency %s "
-                        "stays inside a captured graph", _cur, _n, _n)
-                    self.server_args.cuda_graph_max_bs = _n
+            if _n is not None:
+                self._tile2_concurrency = _n
+                # +2: warmup rows and the hand-off between a finished request and its successor
+                # reach the reclaimer before their pool row is torn down.
+                self._tile2_staging = _n + 2
+                max_num_reqs = _n
+                self.server_args.max_running_requests = _n
+                __import__("os").environ["SGLANG_TILE2_STAGING"] = str(self._tile2_staging)
+                if not self.server_args.disable_cuda_graph:
+                    _cur = self.server_args.cuda_graph_max_bs or 0
+                    if _cur < _n:
+                        logger.warning(
+                            "packed_tile2: raising cuda_graph_max_bs %s -> %s so that concurrency "
+                            "%s stays inside a captured graph", _cur, _n, _n)
+                        self.server_args.cuda_graph_max_bs = _n
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
