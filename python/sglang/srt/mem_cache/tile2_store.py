@@ -1373,7 +1373,7 @@ class Tile2Driver:
             # the position table and the fused kernel masked it out of attention (the warm request
             # then attends only to its own tail -- coherent-looking garbage). Fall back to the
             # device tensor and pay one sync here: this is the extend path, never captured.
-            _pl = getattr(fb, "extend_prefix_lens_cpu", None)
+            _pl = None if os.environ.get("SGLANG_TILE2_PFXCOPY") == "0" else getattr(fb, "extend_prefix_lens_cpu", None)
             if _pl is None:
                 _dev = getattr(fb, "extend_prefix_lens", None)
                 if _dev is not None:
