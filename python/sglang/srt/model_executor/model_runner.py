@@ -1138,7 +1138,8 @@ class ModelRunner:
             # The staging window is a fixed allocation (one open tile per active request per
             # layer). Charging it per token would be circular, so it is subtracted from the
             # available memory just below, which is exact.
-            _stg_rows = int(__import__("os").environ.get("SGLANG_TILE2_STAGING", "8"))
+            _stg_rows = getattr(self, "_tile2_staging",
+                                int(__import__("os").environ.get("SGLANG_TILE2_STAGING", "8")))
             self._fixed_kv_overhead = (2 * num_layers * _stg_rows * T * kvh * hd * 2)
         elif self.server_args.kv_cache_dtype == "packed_int4":
             # Real 4-bit: uint8 payload (head_dim/2) plus, per 32-channel group, a fp16 scale
@@ -1320,6 +1321,37 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
+        if self.server_args.kv_cache_dtype == "packed_tile2":
+            # Decide the three coupled numbers BEFORE profiling: the profiler subtracts the
+            # landing window from the budget, and max_num_reqs is what the scheduler will see.
+            if not self.server_args.disable_radix_cache:
+                raise ValueError(
+                    "packed_tile2 does not support the radix cache: a shared prefix is packed "
+                    "once and then read by later requests, while tile ownership and "
+                    "packed_ntiles assume one owner per tile, so results would be silently "
+                    "wrong. Add --disable-radix-cache.")
+            _n = self.server_args.tile2_concurrency
+            if _n is None:
+                _n = int(max_num_reqs) if max_num_reqs is not None else 8
+            elif max_num_reqs is not None and int(max_num_reqs) != _n:
+                raise ValueError(
+                    "--tile2-concurrency %d conflicts with --max-running-requests %s; "
+                    "for packed_tile2 they must agree (one landing-window slot per request)"
+                    % (_n, max_num_reqs))
+            self._tile2_concurrency = _n
+            # +2: warmup rows and the hand-off between a finished request and its successor
+            # reach the reclaimer before their pool row is torn down.
+            self._tile2_staging = _n + 2
+            max_num_reqs = _n
+            self.server_args.max_running_requests = _n
+            __import__("os").environ["SGLANG_TILE2_STAGING"] = str(self._tile2_staging)
+            if not self.server_args.disable_cuda_graph:
+                _cur = self.server_args.cuda_graph_max_bs or 0
+                if _cur < _n:
+                    logger.warning(
+                        "packed_tile2: raising cuda_graph_max_bs %s -> %s so that concurrency %s "
+                        "stays inside a captured graph", _cur, _n, _n)
+                    self.server_args.cuda_graph_max_bs = _n
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)

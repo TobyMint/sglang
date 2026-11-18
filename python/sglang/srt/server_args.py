@@ -331,6 +331,10 @@ class ServerArgs:
     enable_tool_retention: bool = False
     tool_retention_prior: Optional[str] = None
     cuda_graph_max_bs: Optional[int] = None
+    #: packed_tile2 sizes its landing window per REQUEST (one open tile per concurrent
+    #: request per layer), so concurrency is a real knob: each slot costs 18 MiB of the KV
+    #: budget. Setting this fixes staging, max_running_requests and cuda_graph_max_bs together.
+    tile2_concurrency: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
@@ -1917,6 +1921,14 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--tile2-concurrency",
+            type=int,
+            default=None,
+            choices=[1, 2, 4, 8, 16, 32, 64],
+            help="packed_tile2: how many requests may be resident at once. Sets the landing "
+                 "window (N+2 slots), --max-running-requests and --cuda-graph-max-bs together.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",

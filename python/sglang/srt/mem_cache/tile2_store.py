@@ -942,8 +942,8 @@ class Tile2Driver:
                                f"{self.buf.tiles_per_req} were reserved")
         return base + ti
 
-    def staging_of(self, row: int) -> int:
-        """Staging slot for a request row, with LRU recycling.
+    def staging_of(self, key: int) -> int:
+        """Staging slot for a request, with LRU recycling. `key` = stable request id.
 
         Not tied to ReqToTokenPool.free alone: warmup requests never go through the scheduler's
         normal teardown, so with a free-list-only policy eight warmup rows took every slot and the
@@ -952,12 +952,12 @@ class Tile2Driver:
         victim -- and if every slot belongs to the current batch, this is a real capacity error
         and it says so.
         """
-        self._last_seen[row] = self.steps
-        s = self._stg.get(row)
+        self._last_seen[key] = self.steps
+        s = self._stg.get(key)
         if s is not None:
-            if row in self._lru:
-                self._lru.remove(row)
-            self._lru.append(row)
+            if key in self._lru:
+                self._lru.remove(key)
+            self._lru.append(key)
             return s
         if not self.buf._staging_free:
             current = set(getattr(self, "_active", ()) or ())
@@ -975,38 +975,56 @@ class Tile2Driver:
                   f"(unseen for {self.steps - self._last_seen.get(victim, 0)} steps)", flush=True)
             self.release(victim)
         s = self.buf.alloc_staging()
-        self._stg[row] = s
+        self._stg[key] = s
         base = self.buf.alloc_tile_block(self.buf.tiles_per_req)
         # A block handed to two live requests makes one of them silently decode its payload with
         # the other's scale factors -- the "same magnitude, decorrelated" failure this session spent
         # ten experiments on. Check it at allocation, where the invariant is cheap to state.
         for other, ob in self._blk.items():
-            if other == row or other not in self._len:
+            if other == key or other not in self._len:
                 continue
             if base < ob + self.buf.tiles_per_req and ob < base + self.buf.tiles_per_req:
                 raise RuntimeError(
                     f"[TILE2] tile block [{base}, {base + self.buf.tiles_per_req}) overlaps the "
                     f"block of live request {other} at {ob}")
-        self._blk[row] = base
-        self._lru.append(row)
+        self._blk[key] = base
+        self._lru.append(key)
         return s
 
-    def release(self, row: int) -> None:
-        # `row` is a req_to_token row; the store is keyed by the stable per-request id.
-        row = self._row_key.pop(row, row)
+    def release(self, key: int) -> None:
+        """Free one request's staging slot and tile block.
+
+        `key` is the STABLE request id (the slot of its position 0), which is what `_lru` holds
+        and what `staging_of` is called with -- every map in this class is keyed by it.
+
+        This used to translate the argument through `_row_key` first, i.e. it treated a key as a
+        req_to_token ROW. The two namespaces overlap numerically (rows are 0..~4096, keys are slot
+        ids starting at 0), so whenever a key happened to equal a live row the call popped a
+        stranger's entry: either nothing was freed (the pool then died with "all N staging slots
+        are in use") or another LIVE request's slot was handed out from under it. Both were
+        silent; the second one is corruption. `_row_key` is now only read for row -> key lookups.
+        """
         if _AUDIT:
-            self._released[row] = self.steps
-        if row in self._lru:
-            self._lru.remove(row)
-        base = self._blk.pop(row, None)
+            self._released[key] = self.steps
+        if key in self._lru:
+            self._lru.remove(key)
+        base = self._blk.pop(key, None)
         if base is not None:
             self.buf.free_tile_block(base, self.buf.tiles_per_req)
-        self._pending.pop(row, None)
-        s = self._stg.pop(row, None)
+        self._pending.pop(key, None)
+        s = self._stg.pop(key, None)
         if s is not None:
             self.buf.free_staging(s)
-        self._len.pop(row, None)
-        self._last_seen.pop(row, None)
+        elif _AUDIT:
+            print(f"[TILE2-ARGH] release(key={key}) found no staging slot", flush=True)
+        self._len.pop(key, None)
+        self._last_seen.pop(key, None)
+        # `ridx_of` used to grow without bound; past REQ_SLOTS it wraps and two live requests can
+        # share a `pos_slot` row, which is silent cross-talk. Free it with the rest.
+        self._ridx.pop(key, None)
+        for r, kk in list(self._row_key.items()):
+            if kk == key:
+                self._row_key.pop(r, None)
 
     def _ensure_pos_slot(self, fb) -> None:
         b = self.buf
@@ -1524,6 +1542,19 @@ def install(pool) -> None:
     _INSTALLED = True
     print("[TILE2] installed: q rotation, output un-rotation, write divert, request release",
           flush=True)
+    # The run configuration is otherwise invisible in the log, and "which flags produced this
+    # number" was unknowable often enough to matter. Print it once, from the one place that is
+    # definitely reached by every server.
+    _flags = " ".join("%s=%s" % (k[len("SGLANG_TILE2_"):], os.environ[k])
+                      for k in sorted(os.environ) if k.startswith("SGLANG_TILE2_"))
+    _conc = os.environ.get("SGLANG_TILE2_STAGING")
+    try:
+        _conc = str(int(_conc) - 2) if _conc is not None else "?"
+    except ValueError:
+        _conc = "?"
+    print("[TILE2] concurrency=%s (staging slots=%s, +2 for warmup/teardown)"
+          % (_conc, os.environ.get("SGLANG_TILE2_STAGING", "?")), flush=True)
+    print("[TILE2] flags: %s" % (_flags or "(none)"), flush=True)
 
 
 # ---------------------------------------------------------------- Triton read path
