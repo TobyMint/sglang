@@ -289,7 +289,16 @@ def _tile2_split_decode_kernel(
     lo = sp * per
     hi = tl.minimum(lo + per, ntiles)
     for ti in range(lo, hi):
-        packed = ti < nc
+        # Same rule as the non-split kernel: `packed_ntiles` (nc) counts what THIS request flushed,
+        # and a request that inherited a prefix from the radix cache never flushed those tiles, so
+        # `ti < nc` sends the whole inherited prefix down the landing-window path. Ask the store's
+        # own routing entry for the tile's first row instead. (This path is the one production uses:
+        # the delivered config runs SPLITS=8, so fixing only the non-split kernel changed nothing.)
+        _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
+        _pos0 = ti * T
+        _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
+        _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
+        packed = _sr0 >= 0
         for c0 in range(0, T, BN):
             c = c0 + tl.arange(0, BN)
             posn = ti * T + c
