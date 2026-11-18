@@ -330,8 +330,19 @@ class Tile2Buffers:
         #: SGLANG_TILE2_TILES_PER_REQ is how many tiles one request may use; the default covers a
         #: 16k context at T=128 and caps concurrency at n_tiles/128 requests, which is the same
         #: limit the slot pool already imposes (500k slots / 16k = 30).
+        # Block size decides how many concurrent requests the pool can host: `n_tiles / block`.
+        # The historical 128 (= a 16k context) capped a 486k-token pool at 27 requests. Shrinking
+        # the block raises that ceiling and measured accuracy-neutral (n=200: 71.0% at 40 tiles,
+        # 71.0% at 128). But N blocks with zero slack is fatal -- the first version sized the block
+        # as `n_tiles // N` and died immediately with "no free block of 480 tiles (1 blocks left)",
+        # because a slot/block is only returned by the LRU reclaimer, never on completion. So keep
+        # 4 blocks of slack, and never shrink below what the pool can afford.
+        _conc = os.environ.get("SGLANG_TILE2_CONCURRENCY")
         _want = int(os.environ.get("SGLANG_TILE2_TILES_PER_REQ",
                                    str(max(2, 16384 // T_TILE))))
+        if "SGLANG_TILE2_TILES_PER_REQ" not in os.environ and _conc is not None:
+            _slack = 4
+            _want = min(_want, max(2, self.n_tiles // (max(1, int(_conc)) + _slack)))
         # Never reserve so much that a single request cannot be served; on a toy pool (the unit
         # tests) the floor matters, on a real pool _want is the binding term.
         self.tiles_per_req = max(1, min(_want, max(1, self.n_tiles // 2)))
@@ -1576,13 +1587,16 @@ def install(pool) -> None:
     # definitely reached by every server.
     _flags = " ".join("%s=%s" % (k[len("SGLANG_TILE2_"):], os.environ[k])
                       for k in sorted(os.environ) if k.startswith("SGLANG_TILE2_"))
-    _conc = os.environ.get("SGLANG_TILE2_STAGING")
-    try:
-        _conc = str(int(_conc) - 2) if _conc is not None else "?"
-    except ValueError:
-        _conc = "?"
-    print("[TILE2] concurrency=%s (staging slots=%s, +2 for warmup/teardown)"
-          % (_conc, os.environ.get("SGLANG_TILE2_STAGING", "?")), flush=True)
+    # Export SGLANG_TILE2_CONCURRENCY at the source: the slot count is 2N+2, so N cannot be
+    # recovered from it by arithmetic (deriving it that way printed 2N).
+    print("[TILE2] concurrency=%s (staging slots=%s = 2N+2: two full batches plus hand-off)"
+          % (os.environ.get("SGLANG_TILE2_CONCURRENCY", "? (knob not set)"),
+             os.environ.get("SGLANG_TILE2_STAGING", "?")), flush=True)
+    _buf = getattr(pool, "tile2_buf", None)
+    if _buf is not None:
+        print("[TILE2] tile block = %d tiles per request (pool has %d tiles -> %d concurrent)"
+              % (_buf.tiles_per_req, _buf.n_tiles, _buf.n_tiles // max(1, _buf.tiles_per_req)),
+              flush=True)
     print("[TILE2] flags: %s" % (_flags or "(none)"), flush=True)
 
 

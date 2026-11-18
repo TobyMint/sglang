@@ -1348,12 +1348,24 @@ class ModelRunner:
                     % (_n, max_num_reqs))
             if _n is not None:
                 self._tile2_concurrency = _n
-                # +2: warmup rows and the hand-off between a finished request and its successor
-                # reach the reclaimer before their pool row is torn down.
-                self._tile2_staging = _n + 2
-                max_num_reqs = _n
-                self.server_args.max_running_requests = _n
+                # 2N + 2, not N + 2: a step can admit N fresh requests while the previous N still
+                # hold their slots, and the reclaimer may only take a slot untouched for 32 steps.
+                # Measured with N+2: an n=200 run died on problem 5 with "all 10 staging slots
+                # belong to requests in the current batch". (This is also why the long-standing
+                # "24 slots for 8 concurrent" happened to be safe -- 24 is about 3N.)
+                self._tile2_staging = 2 * _n + 2
+                # Do NOT shrink the request-row pool here. `max_num_reqs` also sizes
+                # `req_to_token_pool`, and this store's bookkeeping is row-keyed
+                # (`_row_key`, `stg_tab`, `pos_slot` via `ridx_tab`): with only N rows every new
+                # request reuses a row immediately, so a lookup can still see the previous
+                # request's key. Measured: setting max_running_requests=N turned an n=200 run from
+                # 71.0% into 15.0%. Concurrency limiting stays the scheduler's business
+                # (--max-running-requests), which is why this knob now only sizes buffers.
                 __import__("os").environ["SGLANG_TILE2_STAGING"] = str(self._tile2_staging)
+                # Tile blocks are carved per request; sizing them from N makes the pool support
+                # exactly N requests instead of the hard-wired "16k context" split (which capped
+                # a 486k-token pool at 27 concurrent requests).
+                __import__("os").environ["SGLANG_TILE2_CONCURRENCY"] = str(_n)
                 if not self.server_args.disable_cuda_graph:
                     _cur = self.server_args.cuda_graph_max_bs or 0
                     if _cur < _n:
