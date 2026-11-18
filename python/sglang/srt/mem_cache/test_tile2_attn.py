@@ -71,7 +71,10 @@ def build(n_tok=300, seed=0):
         drv.step(0, fb, k_all[p:p + 1], v_all[p:p + 1], loc)
     # pubish routing (the engine does this on the prefill path)
     key = int(r2t[1, 0])
-    buf.base_tab[1] = int(drv._blk[key])
+    # base_tab is unused by the read path now (tile ids come from slot_row); with on-demand blocks
+    # there is no single base, so record the first block if one was taken.
+    _blocks = drv._blk.get(key) or []
+    buf.base_tab[1] = int(_blocks[0]) if _blocks else -1
     buf.key_tab[1] = key
     buf.stg_tab[1] = int(drv._stg[key])
     return buf, drv, k_all, v_all, n_tok
@@ -148,7 +151,8 @@ def main():
             pos_of[r] += 1
     for r in range(2):
         key = int(r2t2[r, 0])
-        buf2.base_tab[r] = int(drv2._blk[key])
+        _b2 = drv2._blk.get(key) or []
+        buf2.base_tab[r] = int(_b2[0]) if _b2 else -1
         buf2.key_tab[r] = key
         buf2.stg_tab[r] = int(drv2._stg[key])
     rows2 = torch.tensor([0, 1], dtype=torch.int32, device=DEV)
@@ -206,7 +210,7 @@ def main():
             pos_of[r] += 1
     for r in range(4):
         key = int(r2t4[r, 0])
-        buf4.base_tab[r] = int(drv4._blk[key])
+        buf4.base_tab[r] = -1  # unused: tile ids come from slot_row
         buf4.stg_tab[r] = int(drv4._stg[key])
         buf4.key_tab[r] = key
     rows4 = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=DEV)

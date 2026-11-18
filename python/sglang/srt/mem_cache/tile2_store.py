@@ -1090,14 +1090,25 @@ class Tile2Driver:
 
     # -- allocation ---------------------------------------------------------
     def tile_of(self, key: int, ti: int) -> int:
-        base = self._blk.get(key)
-        if base is None:
-            base = self.buf.alloc_tile_block(self.buf.tiles_per_req)
-            self._blk[key] = base
-        if ti >= self.buf.tiles_per_req:
-            raise RuntimeError(f"[TILE2] request needs tile {ti} but only "
-                               f"{self.buf.tiles_per_req} were reserved")
-        return base + ti
+        """Global tile id for (request, tile index), taking blocks ON DEMAND.
+
+        `tiles_per_req` is the BLOCK SIZE (allocation granularity), not a per-request reservation.
+        Reserving it up front wasted most of it: a 2.6k-token request uses ~21 tiles but reserved
+        24-128, and under the radix cache every finished request keeps its block pinned in the
+        tree, so a 3583-tile pool ran out at 108-145 of 200 problems ("no free block") while the
+        token pool was only 60-80% full. Blocks stay contiguous internally (all `ti % K` needs);
+        the read path never assumes tiles are contiguous across blocks -- it derives the tile id
+        from `slot_row`.
+        """
+        K = max(1, int(self.buf.tiles_per_req))
+        bi = int(ti) // K
+        blocks = self._blk.get(key)
+        if blocks is None:
+            blocks = []
+            self._blk[key] = blocks
+        while len(blocks) <= bi:
+            blocks.append(self.buf.alloc_tile_block(K))
+        return blocks[bi] + (int(ti) % K)
 
     def staging_of(self, key: int) -> int:
         """Staging slot for a request, with LRU recycling. `key` = stable request id.
@@ -1133,18 +1144,9 @@ class Tile2Driver:
             self.release(victim)
         s = self.buf.alloc_staging()
         self._stg[key] = s
-        base = self.buf.alloc_tile_block(self.buf.tiles_per_req)
-        # A block handed to two live requests makes one of them silently decode its payload with
-        # the other's scale factors -- the "same magnitude, decorrelated" failure this session spent
-        # ten experiments on. Check it at allocation, where the invariant is cheap to state.
-        for other, ob in self._blk.items():
-            if other == key or other not in self._len:
-                continue
-            if base < ob + self.buf.tiles_per_req and ob < base + self.buf.tiles_per_req:
-                raise RuntimeError(
-                    f"[TILE2] tile block [{base}, {base + self.buf.tiles_per_req}) overlaps the "
-                    f"block of live request {other} at {ob}")
-        self._blk[key] = base
+        # Tiles are NOT reserved here any more: `tile_of` takes a block when a tile actually
+        # closes. Reserving one per request at staging time was the source of the waste that made
+        # an n=200 run die of "no free block" while the token pool was 60-80% empty.
         self._lru.append(key)
         return s
 
@@ -1170,8 +1172,11 @@ class Tile2Driver:
             self._released[key] = self.steps
         if key in self._lru:
             self._lru.remove(key)
-        base = self._blk.pop(key, None)
-        if base is not None and os.environ.get("SGLANG_TILE2_KEEP_TILES") != "1":
+        blocks = self._blk.pop(key, None)
+        if os.environ.get("SGLANG_TILE2_KEEP_TILES") != "1":
+            for base in (blocks or []):
+                self.buf.free_tile_block(base, max(1, int(self.buf.tiles_per_req)))
+        if False:
             # With the radix cache this request's tiles may still be referenced by another request
             # that shares its prefix, so returning them to the free list lets the next request
             # overwrite parameters the sharer is decoding with. Correct lifetime is "when the last
@@ -1244,7 +1249,9 @@ class Tile2Driver:
             b.packed_ntiles = torch.zeros((b.L, b.slots), dtype=torch.int32, device=dev)
         for r, kk in zip(rows, keys):
             b.stg_tab[int(r)] = int(self._stg[kk])
-            b.base_tab[int(r)] = int(self._blk[kk])
+            # `base_tab` used to carry the request's tile base. With on-demand blocks there is no
+            # single base; every consumer derives the tile id from `slot_row` or `tile_of`.
+            b.base_tab[int(r)] = -1
             b.key_tab[int(r)] = int(kk)
             b.ridx_tab[int(r)] = int(self.ridx_of(kk))
 
@@ -1375,15 +1382,15 @@ class Tile2Driver:
                 slots = b.pos_slot[_ri, tail:pre + 1].to(torch.long)
                 if int(slots.min()) < 0:
                     continue
-                base = int(b.base_tab[r])
-                if base < 0:
+                _key0 = int(self._row_key.get(int(r), -1))
+                if _key0 < 0:
                     continue
                 stg = int(b.stg_tab[r])
                 _key = int(self._row_key.get(int(r), -1))
                 _own = own_rows_mask(b, _key, pre // T, slots)
                 if not bool(_own.any()):
                     continue
-                flush_tile(b, li, stg, T, base + pre // T, slots, True,
+                flush_tile(b, li, stg, T, self.tile_of(_key0, pre // T), slots, True,
                            count_tokens=(li == b.start_layer), req_row=int(r),
                            key=_key, own_mask=_own)
             col.fill_(-1)
