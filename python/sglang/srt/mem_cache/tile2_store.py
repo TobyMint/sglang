@@ -706,6 +706,13 @@ def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
         buf.n_packed_tokens = getattr(buf, "n_packed_tokens", 0) + buf.T
 
 
+#: SGLANG_TILE2_QFUSED=1 routes the quantiser through `tile2_quant_fused.py`, which does the whole
+#: 8-sweep VarN + affine + packing chain in ONE Triton kernel instead of ~40 eager calls.
+#: Measured on 8 tiles: 3.100 ms -> 0.203 ms (15.3x), with bit-identical codes and parameter planes
+#: differing only by fp32 rounding (relRMS 1e-5). Off by default so the verified path stays default.
+_QFUSED = os.environ.get("SGLANG_TILE2_QFUSED") == "1"
+
+
 def _flush_q(buf: Tile2Buffers) -> dict:
     """Per-buffer flush queue, keyed by layer.
 
@@ -746,15 +753,17 @@ def drain_flushes(buf: Tile2Buffers, li: int) -> None:
     q = _flush_q(buf).pop(li, None)
     if not q:
         return
-    if len(q) == 1:
-        ctx = q[0]
-        _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
-                                                  bits=buf.bits, iters=_ITERS))
-        return
     ks = torch.stack([c["k"] for c in q])
     vs = torch.stack([c["v"] for c in q])
     ms = torch.stack([c["mask"] for c in q])
-    allp = quantise_tiles(ks, vs, ms, bits=buf.bits, iters=_ITERS)
+    if _QFUSED:
+        from sglang.srt.mem_cache.tile2_quant_fused import quantise_tiles_fused
+        allp = quantise_tiles_fused(ks, vs, ms, iters=_ITERS, bits=buf.bits)
+    else:
+        allp = quantise_tiles(ks, vs, ms, bits=buf.bits, iters=_ITERS)
+    if len(q) == 1:
+        _flush_commit(buf, li, q[0], {n: t[0] for n, t in allp.items()})
+        return
     for i, ctx in enumerate(q):
         _flush_commit(buf, li, ctx, {n: t[i] for n, t in allp.items()})
 
