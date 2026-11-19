@@ -1335,8 +1335,18 @@ class ModelRunner:
                     "once and then read by later requests, while tile ownership and "
                     "packed_ntiles assume one owner per tile, so results would be silently "
                     "wrong. Add --disable-radix-cache.")
+            # Padding only bites when the true batch size is not an exactly captured one:
+            # `cuda_graph_runner.replay_prepare` does `bisect_left(capture_bs, raw_bs)` and pads up
+            # to `capture_bs[index]`, zeroing `out_cache_loc` for the padded rows. Skipping the pad
+            # is therefore as simple as capturing every size -- then `bs == raw_bs` and neither the
+            # fill nor the zeroing happens. So the guard below only fires for configurations where
+            # padding can actually occur; capturing 1..max_bs is accepted as-is, no flag needed.
+            _cg_list = self.server_args.cuda_graph_bs
+            _cg_covers_all = bool(_cg_list) and sorted(set(_cg_list)) == list(
+                range(1, max(_cg_list) + 1))
             if (not self.server_args.disable_cuda_graph
                     and not self.server_args.disable_cuda_graph_padding
+                    and not _cg_covers_all
                     and __import__("os").environ.get("SGLANG_TILE2_ALLOW_PADDING") != "1"):
                 # Silent-corruption guard. With graph padding on, a batch whose true size is not a
                 # captured one is padded up to the next captured size and replayed; the padded rows
@@ -1348,8 +1358,9 @@ class ModelRunner:
                 raise ValueError(
                     "packed_tile2 with CUDA graph padding enabled computes silently wrong results: "
                     "padded batch rows carry stale landing-window routing and overwrite a live "
-                    "request's newest KV. Add --disable-cuda-graph-padding (and "
-                    "--cuda-graph-bs 1 2 3 4 5 6 7 8 so the un-padded sizes still hit a graph). "
+                    "request's newest KV. Either add --disable-cuda-graph-padding, or capture "
+                    "every batch size so padding never happens (--cuda-graph-bs 1 2 3 4 5 6 7 8); "
+                    "the latter costs ~200 MB of VRAM and keeps full graph coverage. "
                     "Set SGLANG_TILE2_ALLOW_PADDING=1 to run anyway.")
             _n = self.server_args.tile2_concurrency
             if _n is None and max_num_reqs is None:
