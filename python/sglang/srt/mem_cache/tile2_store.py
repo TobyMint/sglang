@@ -477,6 +477,15 @@ class Tile2Buffers:
         else:
             self._blocks.append((start, k))
             self._blocks.sort()
+            # Merge neighbours. Without this the free list fragments after a few hundred requests
+            # and a request needing k consecutive tiles fails even though k are free in total.
+            merged = []
+            for bs, bk in self._blocks:
+                if merged and merged[-1][0] + merged[-1][1] == bs:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + bk)
+                else:
+                    merged.append((bs, bk))
+            self._blocks = merged
 
     def alloc_tile(self) -> int:
         if not self._tiles_free:
@@ -711,6 +720,9 @@ def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
 #: Measured on 8 tiles: 3.100 ms -> 0.203 ms (15.3x), with bit-identical codes and parameter planes
 #: differing only by fp32 rounding (relRMS 1e-5). Off by default so the verified path stays default.
 _QFUSED = os.environ.get("SGLANG_TILE2_QFUSED") == "1"
+#: SGLANG_TILE2_LIFEDBG=1 prints every request retirement (rid -> key + step). This is how the
+#: "one slot per resident request" claim is verified rather than assumed.
+_LIFEDBG = os.environ.get("SGLANG_TILE2_LIFEDBG") == "1"
 
 
 def _flush_q(buf: Tile2Buffers) -> dict:
@@ -941,7 +953,14 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                     # a `.tolist()` per layer. It is also the only source that is correct when a
                     # tile straddles a chunked-prefill boundary, because it is written by the same
                     # call that stages the rows.
-                    cand = buf.pos_slot[row, p - buf.T:p]
+                    # `pos_slot` is indexed by the request's COMPACT index (ridx), never by the
+                    # req_to_token row: the table only has REQ_SLOTS(+1) rows, while row ids run
+                    # into the thousands, so using `row` here read another request's positions or
+                    # went out of bounds. Measured consequence: an n=500 run died at item 239 with
+                    # "IndexError: index 513 is out of bounds for dimension 0 with size 513".
+                    _ri_tile = ridx[i] if ridx is not None else (
+                        ridx_of(int(key)) if ridx_of is not None else int(row))
+                    cand = buf.pos_slot[_ri_tile, p - buf.T:p]
                     if int(cand.numel()) == buf.T and int(cand.min()) >= 0:
                         slots = cand.to(torch.long)
                         nacc = buf.T
@@ -1160,6 +1179,17 @@ class Tile2Driver:
         self._ctx = None
         self._src_dev = None
         self._lru = []
+        # --- request lifecycle -------------------------------------------------------------
+        # `retire_request(rid)` is called from the SCHEDULER thread when a request is finished or
+        # aborted. It only enqueues: the physical reclaim happens on the WORKER thread inside
+        # `drain_retires()` (called from flush_deferred), because returning a staging buffer while
+        # a forward that still reads it is in flight is a GPU use-after-free.
+        self._retire_q = []
+        self._retire_tries = {}
+        self._retired = {}          # key -> step at which it was retired (diagnostics only)
+        #: free list for compact indices; `ridx_of` used to hand out `n % REQ_SLOTS`, which can
+        #: collide with a long-lived request once the counter wraps.
+        self._ridx_free = []
         self._last_seen = {}
         self._released = {}
         self._row_key = {}
@@ -1229,6 +1259,56 @@ class Tile2Driver:
             blocks.append(self.buf.alloc_tile_block(K))
         return blocks[bi] + (int(ti) % K)
 
+    def retire_request(self, rid) -> None:
+        """SCHEDULER thread: this request is finished/aborted, so its slot may be returned.
+
+        Deliberately does not touch any buffer: it only records the rid. `drain_retires()` does the
+        work on the worker thread. An unknown rid is ignored rather than creating an identity --
+        inventing one here is how a stranger's slot gets freed.
+        """
+        if _LIFEDBG:
+            print(f"[T2LIFE] retire_request(rid={rid!r}) called; known="
+                  f"{str(rid) in self._rid_by_req}", flush=True)
+        self._retire_q.append(str(rid))
+
+    def drain_retires(self) -> None:
+        """WORKER thread (from flush_deferred): physically return slots of retired requests.
+
+        A retired request may still appear in `_active` (the batch whose result the scheduler is
+        processing), so it is retried next step. Nothing is freed while still scheduled.
+        """
+        if not self._retire_q:
+            return
+        q, self._retire_q = self._retire_q, []
+        active = set(getattr(self, "_active", ()) or ())
+        for rid in q:
+            key = self._rid_by_req.get(rid)
+            if key is None:
+                if _LIFEDBG:
+                    print(f"[T2LIFE] retire rid={rid!r} has NO key binding "
+                          f"(known rids sample={list(self._rid_by_req)[:3]})", flush=True)
+                continue
+            if key in active and self._retire_tries.get(rid, 0) < 8:
+                self._retire_tries[rid] = self._retire_tries.get(rid, 0) + 1
+                self._retire_q.append(rid)
+                continue
+            if key in active:
+                # Refusing loudly is the point. Freeing a slot that a live request is still writing
+                # is silent corruption (measured once before: n=200 accuracy 0.710 -> 0.555), and a
+                # crash here is far cheaper than a wrong number in a paper table.
+                raise RuntimeError(
+                    f"[TILE2] refusing to retire {rid} (key={key}): still in the active batch "
+                    f"after 8 steps. This means the lifecycle hook and the write path disagree "
+                    f"about ownership; do NOT free it.")
+            self._retire_tries.pop(rid, None)
+            if _AUDIT and key in active:
+                print(f"[TILE2-ARGH] freeing ACTIVE key {key} on retire of {rid}", flush=True)
+            self._retired[key] = self.steps
+            if _LIFEDBG:
+                print(f"[T2LIFE] retire rid={rid} key={key} step={self.steps} "
+                      f"free_before={len(getattr(self.buf, '_staging_free', []))}", flush=True)
+            self.release(key)
+
     def staging_of(self, key: int) -> int:
         """Staging slot for a request, with LRU recycling. `key` = stable request id.
 
@@ -1247,20 +1327,30 @@ class Tile2Driver:
             self._lru.append(key)
             return s
         if not self.buf._staging_free:
+            # CORRECT release: requests that actually ENDED, reported by the scheduler hook.
+            self.drain_retires()
+        if not self.buf._staging_free:
+            # Leak guard ONLY. A key that never saw a retire and has been untouched for a very long
+            # time is almost certainly a warmup/synthetic identity (they never reach the scheduler's
+            # teardown). 512 steps is a leak detector, NOT a correctness mechanism: the previous
+            # version used 32 steps as one and recycled LIVE requests -- measured n=200 0.710 ->
+            # 0.555, and short requests (MMLU) exhausted 24 slots on the first item.
             current = set(getattr(self, "_active", ()) or ())
-            # A request writes on every step it is scheduled, so a row not touched for a while is
-            # finished. Warmup requests never reach ReqToTokenPool.free, which is the only reason
-            # this timer exists at all.
             victim = next((r for r in self._lru
-                           if r not in current
-                           and self.steps - self._last_seen.get(r, 0) > 32), None)
-            if victim is None:
-                raise RuntimeError(
-                    f"[TILE2] all {self.buf.max_staging} staging slots belong to requests in the "
-                    f"current batch; raise SGLANG_TILE2_STAGING")
-            print(f"[TILE2] recycling staging of stale row {victim} "
-                  f"(unseen for {self.steps - self._last_seen.get(victim, 0)} steps)", flush=True)
-            self.release(victim)
+                           if r not in current and r not in self._retired
+                           and self.steps - self._last_seen.get(r, 0) > 512), None)
+            if victim is not None:
+                print(f"[TILE2] leak guard: recycling key {victim}, unseen for "
+                      f"{self.steps - self._last_seen.get(victim, 0)} steps, no retire seen",
+                      flush=True)
+                self.release(victim)
+        if not self.buf._staging_free:
+            _ages = sorted(self.steps - self._last_seen.get(k, -10**9) for k in self._lru)
+            raise RuntimeError(
+                f"[TILE2] all {self.buf.max_staging} staging slots are held by live requests; "
+                f"with the retire hook this means concurrency > SGLANG_TILE2_STAGING. "
+                f"steps={self.steps} n_active={len(set(getattr(self, '_active', ()) or ()))} "
+                f"n_slots={len(self._lru)} youngest_ages={_ages[:6]}")
         s = self.buf.alloc_staging()
         self._stg[key] = s
         # Tiles are NOT reserved here any more: `tile_of` takes a block when a tile actually
@@ -1282,11 +1372,11 @@ class Tile2Driver:
         are in use") or another LIVE request's slot was handed out from under it. Both were
         silent; the second one is corruption. `_row_key` is now only read for row -> key lookups.
         """
-        if not _free_release():
-            # Historical behaviour, and deliberately the default: translate the argument through
-            # `_row_key` as if it were a req_to_token ROW. That is wrong (see the docstring) and it
-            # is also *load bearing* -- see the note above `_free_release`.
-            key = self._row_key.pop(key, key)
+        # `key` is ALWAYS the stable request key, never a req_to_token row. The old row-translating
+        # branch (which an env var could re-enable) silently freed a stranger's entries because the
+        # two namespaces overlap numerically. One switch for one meaning only.
+        if key in self._retired:
+            self._retired.pop(key)
         if _AUDIT:
             self._released[key] = self.steps
         if key in self._lru:
@@ -1304,16 +1394,22 @@ class Tile2Driver:
             self.buf.free_tile_block(base, self.buf.tiles_per_req)
         self._pending.pop(key, None)
         s = self._stg.pop(key, None)
+        if _LIFEDBG:
+            print(f"[T2LIFE] release(key={key}) staging={'FREED' if s is not None else 'MISSING'}"
+                  f" lru={len(self._lru)} free={len(getattr(self.buf, '_staging_free', []))}",
+                  flush=True)
         if s is not None:
+            assert self._stg.get(key) is None, "release() left a staging binding behind"
             self.buf.free_staging(s)
         elif _AUDIT:
             print(f"[TILE2-ARGH] release(key={key}) found no staging slot", flush=True)
         self._len.pop(key, None)
         self._last_seen.pop(key, None)
-        if _free_release():
-            # `ridx_of` used to grow without bound; past REQ_SLOTS it wraps and two live requests
-            # can share a `pos_slot` row, which is silent cross-talk. Free it with the rest.
-            self._ridx.pop(key, None)
+        if True:
+            # Hand the compact index back so it can be reused (see `ridx_of`).
+            _ri = self._ridx.pop(key, None)
+            if _ri is not None:
+                self._ridx_free.append(_ri)
             for r, kk in list(self._row_key.items()):
                 if kk == key:
                     self._row_key.pop(r, None)
@@ -1352,11 +1448,19 @@ class Tile2Driver:
             b.key_tab = torch.zeros((r2t.shape[0],), dtype=torch.int32, device=b.device)
 
     def ridx_of(self, key: int) -> int:
-        """A compact index for this request, stable for its lifetime."""
+        """A compact index for this request, stable for its lifetime.
+
+        Allocation is a real free list. Wrapping `_ridx_next % REQ_SLOTS` (the previous version)
+        can hand an index to a new request while a long-lived request still owns it, which makes two
+        live requests share a `pos_slot` row -- silent cross-talk, not a crash.
+        """
         r = self._ridx.get(key)
         if r is None:
-            r = self._ridx_next
-            self._ridx_next = (self._ridx_next + 1) % REQ_SLOTS
+            if self._ridx_free:
+                r = self._ridx_free.pop()
+            else:
+                r = self._ridx_next % REQ_SLOTS
+                self._ridx_next = (self._ridx_next + 1) % REQ_SLOTS
             self._ridx[key] = r
         return r
 
@@ -1496,6 +1600,26 @@ class Tile2Driver:
         # touch host state. Without this a request that is happily decoding looks "unseen" to the
         # reclaimer after a few dozen steps and its staging slot is recycled underneath it.
         self.steps += 1
+        # `_active` must be the set of keys the WRITE path is actually touching, not what some other
+        # hook recorded. Measured failure: `n_active=1` while all 8 slots had age 0, so the reclaimer
+        # believed 7 slots were free while 8 requests were mid-decode. Rows are the source of truth
+        # here because flush_deferred sees exactly the batch's req_pool_indices.
+        try:
+            _act = set()
+            for _r in rows_now:
+                _rid = self._row_rid.get(int(_r))
+                if _rid is None:
+                    continue
+                _k = self._rid_by_req.get(_rid)
+                if _k is not None:
+                    _act.add(_k)
+            if _act:
+                self._active = _act
+        except Exception:
+            pass
+        # Retired requests are reclaimed here: this is the worker thread, after the previous
+        # batch's kernels were enqueued, so no in-flight read can still reference these buffers.
+        self.drain_retires()
         # The graph-safe decode path cannot maintain the row -> stable-request-id map (it may not
         # read device memory), so do it here, outside the captured region. Without this the tile
         # count is never published and the fused kernel treats the whole history as unflushed.
@@ -1953,6 +2077,46 @@ def install(pool) -> None:
     #     missing, which is what `have=92 want=128` was telling us.
     # Staging lifetime is therefore decided by activity alone (see staging_of): a row that has not
     # appeared in a batch for a while is gone, whichever hook sglang did or did not call.
+    # ---- lifecycle hook: request END -> return the slot immediately -------------------------
+    # Installed on the INSTANCE the scheduler actually picks (RadixCache / ChunkCache / SWA / the
+    # C++ cache all implement cache_finished_req separately, and BasePrefixCache's version is
+    # abstract, so patching a class would silently miss cases). NOT on ReqToTokenPool.free: chunked
+    # prefill (scheduler.py:get_next_batch_to_run) and retract_decode also free rows for requests
+    # that are still alive, so a row free is not a death certificate.
+    try:
+        from sglang.srt.managers.scheduler import Scheduler as _Sched
+        _orig_init_cache = _Sched.init_memory_pool_and_cache
+
+        def _init_memory_pool_and_cache(self, *a, **kw):
+            out = _orig_init_cache(self, *a, **kw)
+            try:
+                cache = self.tree_cache
+                if not getattr(cache, "_tile2_hooked", False):
+                    _orig_fin = cache.cache_finished_req
+
+                    def cache_finished_req(req, *aa, **kk):
+                        rid = getattr(req, "rid", None)
+                        res = _orig_fin(req, *aa, **kk)      # only notify AFTER the cleanup ran
+                        if rid is not None:
+                            try:
+                                pool.tile2_drv.retire_request(rid)
+                            except Exception as e:           # never break teardown
+                                print(f"[TILE2] retire notify failed for {rid}: {e}", flush=True)
+                        return res
+
+                    cache.cache_finished_req = cache_finished_req
+                    cache._tile2_hooked = True
+                    print("[T2HOOK] cache_finished_req patched on the live cache instance",
+                          flush=True)
+            except Exception as e:
+                print(f"[T2HOOK] FAILED to patch cache_finished_req: {e}", flush=True)
+            return out
+
+        _Sched.init_memory_pool_and_cache = _init_memory_pool_and_cache
+        print("[T2HOOK] Scheduler.init_memory_pool_and_cache patched (lifecycle hook)", flush=True)
+    except Exception as e:
+        print(f"[T2HOOK] lifecycle hook NOT installed: {e}", flush=True)
+
     _INSTALLED = True
     print("[TILE2] installed: q rotation, output un-rotation, write divert, request release",
           flush=True)
@@ -1961,11 +2125,14 @@ def install(pool) -> None:
     # definitely reached by every server.
     _flags = " ".join("%s=%s" % (k[len("SGLANG_TILE2_"):], os.environ[k])
                       for k in sorted(os.environ) if k.startswith("SGLANG_TILE2_"))
-    # Export SGLANG_TILE2_CONCURRENCY at the source: the slot count is 2N+2, so N cannot be
-    # recovered from it by arithmetic (deriving it that way printed 2N).
-    print("[TILE2] concurrency=%s (staging slots=%s = 2N+2: two full batches plus hand-off)"
-          % (os.environ.get("SGLANG_TILE2_CONCURRENCY", "? (knob not set)"),
-             os.environ.get("SGLANG_TILE2_STAGING", "?")), flush=True)
+    # Export SGLANG_TILE2_CONCURRENCY at the source. The slot count used to be 2N+2 because
+    # nothing returned a slot when a request ended: the only recycler was "this slot has not been
+    # touched for 32 steps", which recycled LIVE requests (n=200 accuracy 0.710 -> 0.555) and still
+    # ran out under short requests (MMLU needed 48 slots for 8 concurrent requests). With the
+    # lifecycle hook the rule is simply: one slot per resident request.
+    print("[TILE2] concurrency=%s (staging slots=%s; with SGLANG_TILE2_STAGING unset this equals "
+          "the concurrency, because slots are now returned when a request finishes)"
+          % (os.environ.get("SGLANG_TILE2_CONCURRENCY", "?"), pool.tile2_buf.max_staging), flush=True)
     _buf = getattr(pool, "tile2_buf", None)
     if _buf is not None:
         print("[TILE2] tile block = %d tiles per request (pool has %d tiles -> %d concurrent)"

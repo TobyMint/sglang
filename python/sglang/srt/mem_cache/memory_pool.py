@@ -52,6 +52,37 @@ if _is_npu:
     import torch_npu
 
 
+def _tile2_staging_slots(pool) -> int:
+    """How many staging slots ("落地窗") to preallocate.
+
+    The rule used to be `2N+2` because nothing returned a slot when a request ended: the only
+    recycler was "this slot has not been touched for 32 steps", which recycled LIVE requests
+    (n=200 accuracy 0.710 -> 0.555) and still ran out under short requests (MMLU needed 48 slots
+    for 8 concurrent requests). With the lifecycle hook (retire on request end) the requirement is
+    no longer a guess, so it drops from 24-48 to concurrency + 1, measured:
+
+      slots =  8  -> crashes: sglang runs 8 decodes + 1 new prefill = 9 live requests
+      slots =  9  -> MMLU 200 acc 0.725 / MATH500 200 acc 0.845 / radix-on n=50 acc 0.800, 0 crashes
+      slots = 10  -> same, one more spare
+
+    So the default is N+1 (one hand-off slot for the mixed decode+prefill batch). Set
+    SGLANG_TILE2_STAGING to override.
+    """
+    import os as _os
+    env = _os.environ.get("SGLANG_TILE2_STAGING")
+    if env:
+        return int(env)
+    conc = None
+    for attr in ("tile2_concurrency", "max_running_requests"):
+        v = getattr(getattr(pool, "server_args", None), attr, None)
+        if v:
+            conc = int(v)
+            break
+    if not conc:
+        conc = 8          # matches the default cuda-graph batch bound on this GPU class
+    return max(1, conc + 1)
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -610,7 +641,7 @@ class MHATokenToKVPool(KVCache):
             self.tile2_buf = Tile2Buffers(
                 size=self.size, page_size=self.page_size, head_num=self.head_num,
                 head_dim=self.head_dim, layer_num=self.layer_num, device=self.device,
-                max_staging=int(__import__("os").environ.get("SGLANG_TILE2_STAGING", "8")))
+                max_staging=_tile2_staging_slots(self))
             self.tile2_drv = Tile2Driver(self.tile2_buf)
             print(self.tile2_buf.report(), flush=True)
             install(self)
