@@ -172,7 +172,8 @@ def _varn_masked(x: torch.Tensor, m: torch.Tensor, iters: int):
     """VarN on [1,T,H,D] with reductions weighted by the row mask m: [1,T,1,1]."""
     A = torch.ones_like(x[:, :1, :, :])
     B = torch.ones_like(x[:, :, :, :1])
-    denom = m.sum().clamp(min=1.0)
+    # Per-tile denominator so a batch of tiles computes exactly what they would one by one.
+    denom = m.sum(dim=(1, 2, 3), keepdim=True).clamp(min=1.0)
     for _ in range(iters):
         sc = ((x.pow(2) * m).sum(dim=1, keepdim=True) / denom).sqrt().clamp_(min=1e-8)
         x = x / sc
@@ -183,24 +184,26 @@ def _varn_masked(x: torch.Tensor, m: torch.Tensor, iters: int):
     return x, A, B
 
 
-def quantise_tile(k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, bits: int = 2,
-                  iters: int = 8):
-    """Quantise one tile of ALREADY ROTATED values. k, v: [T,H,D]; mask: [T] bool.
+def quantise_tiles(ks: torch.Tensor, vs: torch.Tensor, masks: torch.Tensor,
+                   bits: int = 2, iters: int = 8):
+    """Quantise N tiles at once of ALREADY ROTATED values. ks, vs: [N,T,H,D]; masks: [N,T] bool.
 
-    Returns the target-format pieces: packed uint8 codes plus fp16 parameters. Nothing here is
-    float32 after the return, so what the caller stores is what gets counted.
+    Batching is the whole point: one tile measured 4.4 ms and eight together measured 5.1 ms,
+    because the cost is the ~40-strong serial chain of small eager kernels (131k elements each),
+    not arithmetic. A prefill step closes ~8 tiles per layer, so per-tile quantisation alone was
+    1179 ms per ~1k-token prefill -- over 70% of the whole prefill.
     """
-    Tn, H, D = k.shape
+    N, Tn, H, D = ks.shape
     qmax = (1 << bits) - 1
-    m = mask.view(1, Tn, 1, 1).to(torch.float32)
+    m = masks.view(N, Tn, 1, 1).to(torch.float32)
 
-    x = k.float().unsqueeze(0)
-    y = v.float().unsqueeze(0)
+    x = ks.float()
+    y = vs.float()
     x, A_k, B_k = _varn_masked(x, m, iters)
     y, A_v, B_v = _varn_masked(y, m, iters)
 
     big = torch.finfo(torch.float32).max
-    fill = (~mask).view(1, -1, 1, 1)
+    fill = (~masks).view(N, Tn, 1, 1)
     lo_k = torch.where(fill, torch.full_like(x, big), x).amin(dim=1, keepdim=True)
     hi_k = torch.where(fill, torch.full_like(x, -big), x).amax(dim=1, keepdim=True)
     sc_k = ((hi_k - lo_k) / qmax).clamp(min=1e-8)
@@ -213,13 +216,22 @@ def quantise_tile(k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, bits: in
 
     h = torch.float16
     return dict(
-        codes_k=pack2(q_k.squeeze(0)),
-        codes_v=pack2(q_v.squeeze(0)),
-        k_sc=sc_k.squeeze(0).squeeze(0).to(h), k_lo=lo_k.squeeze(0).squeeze(0).to(h),
-        k_A=A_k.squeeze(0).squeeze(0).to(h), k_B=B_k.squeeze(0).squeeze(-1).to(h),
-        v_sc=sc_v.squeeze(0).squeeze(-1).to(h), v_lo=lo_v.squeeze(0).squeeze(-1).to(h),
-        v_A=A_v.squeeze(0).squeeze(0).to(h), v_B=B_v.squeeze(0).squeeze(-1).to(h),
+        codes_k=pack2(q_k),
+        codes_v=pack2(q_v),
+        k_sc=sc_k.squeeze(1).to(h), k_lo=lo_k.squeeze(1).to(h),
+        k_A=A_k.squeeze(1).to(h), k_B=B_k.squeeze(-1).to(h),
+        v_sc=sc_v.squeeze(-1).to(h), v_lo=lo_v.squeeze(-1).to(h),
+        v_A=A_v.squeeze(1).to(h), v_B=B_v.squeeze(-1).to(h),
     )
+
+
+def quantise_tile(k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, bits: int = 2,
+                  iters: int = 8):
+    """One tile of ALREADY ROTATED values. k, v: [T,H,D]; mask: [T] bool. Thin wrapper -- the
+    batched form above is what the hot path uses."""
+    out = quantise_tiles(k.unsqueeze(0), v.unsqueeze(0), mask.unsqueeze(0), bits=bits,
+                         iters=iters)
+    return {n: t[0] for n, t in out.items()}
 
 
 class Tile2Buffers:
@@ -569,17 +581,17 @@ def own_rows_mask(buf: Tile2Buffers, key: int, ti: int, slots: torch.Tensor) -> 
     return om
 
 
-def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
-               slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
-               req_row: int = -1, key: int = -1, own_mask=None) -> None:
-    """Move one open staging tile in layer `li` into the packed region.
+def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
+                   slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
+                   req_row: int = -1, key: int = -1, own_mask=None):
+    """Gather one closing tile out of the landing window and build its row mask.
 
-    The staging rows are contiguous (rows are appended in position order), so there is no gather
-    here: the only scatter is the write of the 128 packed rows into their pool slots.
-
-    `tile` is passed in rather than allocated here on purpose: the tile id has to be the SAME for
-    every layer of a step, and 36 independent allocations would give 36 different ids.
+    Split out of `flush_tile` so that all the tiles closing in one layer can be quantised in ONE
+    batched call: a single `quantise_tile` measured 4375 us for a 128x8x128 tile while eight
+    together measured 5104 us, i.e. 6.9x cheaper per tile. The cost there is the ~40-strong serial
+    chain of small eager kernels, not arithmetic, so batching is what removes it.
     """
+
     base = stg * buf.T
     slots = slots.to(torch.long)
     k = buf.staging_k[li, base:base + n_valid]
@@ -589,7 +601,7 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
     if own_mask is not None:
         mask[:own_mask.numel()] &= own_mask
         if not bool(mask.any()):
-            return
+            return None
     if n_valid < buf.T:                       # pad with zeros; the mask keeps them out of the stats
         pad = buf.T - n_valid
         k = torch.cat([k, torch.zeros(pad, buf.H, buf.D, dtype=k.dtype, device=k.device)], 0)
@@ -614,7 +626,17 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
             if nbad:
                 print(f"[TILE2-ARGH] staging mismatch at flush: {nbad}/{len(hit)} rows "
                       f"worse than 5% (worst {float(bad.max()):.3f}) layer={li}", flush=True)
-    parts = quantise_tile(kq_, vq_, mask, bits=buf.bits, iters=_ITERS)
+    return dict(k=kq_, v=vq_, mask=mask, slots=slots, tile=int(tile),
+                update_map=update_map, count_tokens=count_tokens, key=key,
+                n_valid=int(n_valid))
+
+
+def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
+    """Write one tile's codes, its eight parameter planes and its routing entry."""
+    slots, mask = ctx["slots"], ctx["mask"]
+    tile, update_map = ctx["tile"], ctx["update_map"]
+    count_tokens, key = ctx["count_tokens"], ctx["key"]
+    kq_, n_valid = ctx["k"], ctx["n_valid"]
     if os.environ.get("SGLANG_TILE2_QERR") == "1" and li == 0 and (int(tile) % 20 == 0):
         # Homogeneity of the rows that went into this tile's per-channel statistics. If a tile
         # mixes rows from different requests (or from different staging leases), the token-axis
@@ -667,6 +689,65 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
         # difference between layer 0 and the layers that read it). Counting must not: it is a
         # per-tile quantity and would otherwise be multiplied by the number of layers.
         buf.n_packed_tokens = getattr(buf, "n_packed_tokens", 0) + buf.T
+
+
+def _flush_q(buf: Tile2Buffers) -> dict:
+    """Per-buffer flush queue, keyed by layer.
+
+    Not a module-level dict keyed by `id(buf)`: a freed buffer's id is reused by the next one, and
+    a queue left behind (a path that stages a tile but never drains) would then be written into an
+    unrelated pool. Owned by the buffer, that cannot happen.
+    """
+    q = buf.__dict__.get("_flush_q")
+    if q is None:
+        q = buf.__dict__["_flush_q"] = {}
+    return q
+
+
+def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
+                slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
+                req_row: int = -1, key: int = -1, own_mask=None) -> None:
+    """Stage a closing tile; `drain_flushes` quantises the whole layer's batch in one go."""
+    ctx = _flush_prepare(buf, li, stg, n_valid, tile, slots, update_map, count_tokens,
+                         req_row, key, own_mask)
+    if ctx is not None:
+        # COPY before queueing. `ctx["k"]` is a VIEW into the landing window, and as soon as this
+        # tile closes the window restarts at fill = 0 for the request's next tile -- so by the time
+        # the layer ends and the batch is quantised, that memory holds a different tile's rows.
+        # Batching without this copy quantised the wrong data (P2 caught it: V relRMS 0.997).
+        ctx["k"] = ctx["k"].clone()
+        ctx["v"] = ctx["v"].clone()
+        ctx["slots"] = ctx["slots"].clone()
+        _flush_q(buf).setdefault(li, []).append(ctx)
+
+
+def drain_flushes(buf: Tile2Buffers, li: int) -> None:
+    q = _flush_q(buf).pop(li, None)
+    if not q:
+        return
+    if len(q) == 1:
+        ctx = q[0]
+        _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
+                                                  bits=buf.bits, iters=_ITERS))
+        return
+    ks = torch.stack([c["k"] for c in q])
+    vs = torch.stack([c["v"] for c in q])
+    ms = torch.stack([c["mask"] for c in q])
+    allp = quantise_tiles(ks, vs, ms, bits=buf.bits, iters=_ITERS)
+    for i, ctx in enumerate(q):
+        _flush_commit(buf, li, ctx, {n: t[i] for n, t in allp.items()})
+
+
+def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
+               slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
+               req_row: int = -1, key: int = -1, own_mask=None) -> None:
+    """Immediate one-tile path (tests and diagnostics); the hot paths queue + drain."""
+    ctx = _flush_prepare(buf, li, stg, n_valid, tile, slots, update_map, count_tokens,
+                         req_row, key, own_mask)
+    if ctx is None:
+        return
+    _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
+                                              bits=buf.bits, iters=_ITERS))
 
 
 def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows, keys, loc,
@@ -881,11 +962,12 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                 if not bool(_own.any()):
                     fill = 0          # fully inherited tile: nothing of ours to pack
                     continue
-                flush_tile(buf, li, stg, buf.T, tile_of(key, _ti), slots, update_map,
-                           count_tokens=(li == buf.start_layer), req_row=row, key=key,
-                           own_mask=_own)
+                queue_flush(buf, li, stg, buf.T, tile_of(key, _ti), slots, update_map,
+                            count_tokens=(li == buf.start_layer), req_row=row, key=key,
+                            own_mask=_own)
                 fill = 0
         start = end
+    drain_flushes(buf, li)
 
 
 def gather_dequant_torch(buf: Tile2Buffers, li: int, idx: torch.Tensor,
@@ -1390,9 +1472,10 @@ class Tile2Driver:
                 _own = own_rows_mask(b, _key, pre // T, slots)
                 if not bool(_own.any()):
                     continue
-                flush_tile(b, li, stg, T, self.tile_of(_key0, pre // T), slots, True,
-                           count_tokens=(li == b.start_layer), req_row=int(r),
-                           key=_key, own_mask=_own)
+                queue_flush(b, li, stg, T, self.tile_of(_key0, pre // T), slots, True,
+                            count_tokens=(li == b.start_layer), req_row=int(r),
+                            key=_key, own_mask=_own)
+            drain_flushes(b, li)
             col.fill_(-1)
             if b.closed_mask is not None:
                 b.closed_mask[li].fill_(False)
