@@ -285,7 +285,10 @@ class Tile2Buffers:
         self.v_lo = torch.zeros((L, n, self.T, self.H), dtype=torch.float16, device=device)
         self.v_A = torch.zeros((L, n, self.H, self.D), dtype=torch.float16, device=device)
         self.v_B = torch.zeros((L, n, self.T, self.H), dtype=torch.float16, device=device)
-        self.staging_k = torch.zeros((self.L, max_staging * self.T, self.H, self.D),
+        #: +1 row is the padding dustbin, and it must live OUTSIDE the staging slots: the first
+        #: attempt reused the last row of slot `max_staging-1`, so padded writes clobbered a live
+        #: request's row 127 and padding-on accuracy came out 0.565 instead of the 0.710 reference.
+        self.staging_k = torch.zeros((self.L, max_staging * self.T + 1, self.H, self.D),
                                      dtype=torch.bfloat16, device=device)
         self.staging_v = torch.zeros_like(self.staging_k)
         self._Hk = None
@@ -722,6 +725,12 @@ def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
     """Stage a closing tile; `drain_flushes` quantises the whole layer's batch in one go."""
     ctx = _flush_prepare(buf, li, stg, n_valid, tile, slots, update_map, count_tokens,
                          req_row, key, own_mask)
+    if ctx is not None and os.environ.get("SGLANG_TILE2_FLUSH_NOW") == "1":
+        # Diagnostic: quantise immediately (pre-batching behaviour) so an A/B can tell whether
+        # deferring the quantisation to the end of the layer changed anything numerically.
+        _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
+                                                  bits=buf.bits, iters=_ITERS))
+        return
     if ctx is not None:
         # COPY before queueing. `ctx["k"]` is a VIEW into the landing window, and as soon as this
         # tile closes the window restarts at fill = 0 for the request's next tile -- so by the time
@@ -1313,7 +1322,7 @@ class Tile2Driver:
             # rejects. The extra pos_slot row and the last staging row are never read by anyone.
             b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
             b.dustbin_pos_row = int(REQ_SLOTS)
-            b.dustbin_stg_row = int(b.max_staging * b.T - 1)
+            b.dustbin_stg_row = int(b.max_staging * b.T)   # the extra row, outside every slot
         if b.ridx_tab is None:
             b.ridx_tab = torch.zeros((r2t.shape[0],), dtype=torch.int32, device=b.device)
         if b.packed_ntiles is None:
@@ -1385,7 +1394,7 @@ class Tile2Driver:
             # rejects. The extra pos_slot row and the last staging row are never read by anyone.
             b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
             b.dustbin_pos_row = int(REQ_SLOTS)
-            b.dustbin_stg_row = int(b.max_staging * b.T - 1)
+            b.dustbin_stg_row = int(b.max_staging * b.T)   # the extra row, outside every slot
         if b.ridx_tab is None:
             b.ridx_tab = torch.zeros((r2t.shape[0],), dtype=torch.int32, device=b.device)
         if b.stg_tab is None:
