@@ -979,8 +979,15 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                         print(f"[TILE2-ARGH] tile {_ti} key={key} li={li}: {nd}/{buf.T} slots "
                               f"in the map do not match the staged encoding "
                               f"(map[0]={int(cur[0])} want[0]={int(want[0])})", flush=True)
-                _own = own_rows_mask(buf, key, _ti, slots)
-                if not bool(_own.any()):
+                # ONLY with the radix cache can a row of this tile belong to someone else. With
+                # it off, a slot whose `slot_row` still looks packed is simply a slot that a
+                # PREVIOUS request used and sglang has since freed -- `own_rows_mask` would then
+                # skip packing this request's own row, and that position would read another
+                # request's bytes forever. Slot reuse only starts after enough requests have run,
+                # which is exactly the shape of the observed cliff (fine for 160 requests, then
+                # 0.05). Measured: 0.595 -> 0.71 by gating this on the radix flag.
+                _own = own_rows_mask(buf, key, _ti, slots) if getattr(buf, "radix_on", True) else None
+                if _own is not None and not bool(_own.any()):
                     fill = 0          # fully inherited tile: nothing of ours to pack
                     continue
                 queue_flush(buf, li, stg, buf.T, tile_of(key, _ti), slots, update_map,
@@ -1528,8 +1535,10 @@ class Tile2Driver:
                     continue
                 stg = int(b.stg_tab[r])
                 _key = int(self._row_key.get(int(r), -1))
-                _own = own_rows_mask(b, _key, pre // T, slots)
-                if not bool(_own.any()):
+                # See the write path: ownership only means something when prefixes are shared.
+                _own = (own_rows_mask(b, _key, pre // T, slots)
+                        if getattr(b, "radix_on", True) else None)
+                if _own is not None and not bool(_own.any()):
                     continue
                 queue_flush(b, li, stg, T, self.tile_of(_key0, pre // T), slots, True,
                             count_tokens=(li == b.start_layer), req_row=int(r),
