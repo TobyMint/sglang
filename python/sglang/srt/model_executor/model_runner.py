@@ -1335,6 +1335,22 @@ class ModelRunner:
                     "once and then read by later requests, while tile ownership and "
                     "packed_ntiles assume one owner per tile, so results would be silently "
                     "wrong. Add --disable-radix-cache.")
+            if (not self.server_args.disable_cuda_graph
+                    and not self.server_args.disable_cuda_graph_padding
+                    and __import__("os").environ.get("SGLANG_TILE2_ALLOW_PADDING") != "1"):
+                # Silent-corruption guard. With graph padding on, a batch whose true size is not a
+                # captured one is padded up to the next captured size and replayed; the padded rows
+                # are copies of the last real request and carry a STALE landing-window routing
+                # entry. This store writes KV for every row of the batch, so those dummy rows
+                # overwrite a live request's newest-token rows. Measured on MATH500 n=200, same
+                # code, the only variable being this flag: padding on 40.5% vs off 71.0%. There is
+                # no error and no log line, which is exactly why it is refused here.
+                raise ValueError(
+                    "packed_tile2 with CUDA graph padding enabled computes silently wrong results: "
+                    "padded batch rows carry stale landing-window routing and overwrite a live "
+                    "request's newest KV. Add --disable-cuda-graph-padding (and "
+                    "--cuda-graph-bs 1 2 3 4 5 6 7 8 so the un-padded sizes still hit a graph). "
+                    "Set SGLANG_TILE2_ALLOW_PADDING=1 to run anyway.")
             _n = self.server_args.tile2_concurrency
             if _n is None and max_num_reqs is None:
                 # OPT-IN ONLY. Deriving a concurrency when the user said nothing looked tidy, but
