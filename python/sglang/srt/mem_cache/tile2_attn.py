@@ -83,6 +83,7 @@ def _tile2_fused_decode_kernel(
     HQ: tl.constexpr,            # query heads
     BQ_: tl.constexpr,           # padded query tile
     BN: tl.constexpr,            # tokens per k/v chunk
+    USE_SROW: tl.constexpr = True,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -113,17 +114,23 @@ def _tile2_fused_decode_kernel(
 
     ntiles = (n + T - 1) // T
     for ti in range(0, ntiles):
-        # NOT `ti < nc`: with the radix cache a request inherits packed tiles from whoever wrote
-        # the shared prefix and never flushes them, so its own `packed_ntiles` count stays at 0
-        # while the whole prefix is packed -- reading it from the landing window returns another
-        # request's bytes. Ask the store's routing table about the tile's first row instead; the
-        # packed branch below already falls back PER ROW to the landing window for any slot that
-        # is still staged, so one probe per tile is enough even for a mixed tile.
-        _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
-        _pos0 = ti * T
-        _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
-        _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
-        packed = _sr0 >= 0
+        # A launch-time choice between two rules.
+        #  USE_SROW (radix cache on): `slot_row` is the only entry that knows a tile belongs to
+        #    ANOTHER request, so a shared prefix decodes from codes instead of a landing window
+        #    that no longer holds it.
+        #  not USE_SROW (radix off): keep the layer-local count. `slot_row` is shared by all 36
+        #    layers and is published by layer 0's flush, while a layer's codes are written only
+        #    when THAT layer flushes -- so `slot_row` makes the upper layers decode a just-closed
+        #    tile out of a different tile's codes. Measured (MATH500 n=200, radix off): 0.710 with
+        #    the count, 0.555 with slot_row, loss concentrated on the longest generations.
+        if USE_SROW:
+            _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
+            _pos0 = ti * T
+            _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
+            _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
+            packed = _sr0 >= 0
+        else:
+            packed = ti < nc
 
         for c0 in range(0, T, BN):
             c = c0 + tl.arange(0, BN)
@@ -247,7 +254,7 @@ def _tile2_split_decode_kernel(
     MIDO, MIDLSE, SCALE,
     RSTR: tl.constexpr, H: tl.constexpr, D: tl.constexpr, T: tl.constexpr,
     G: tl.constexpr, HQ: tl.constexpr, BQ_: tl.constexpr, BN: tl.constexpr,
-    SPLITS: tl.constexpr, ROT: tl.constexpr = False,
+    SPLITS: tl.constexpr, ROT: tl.constexpr = False, USE_SROW: tl.constexpr = True,
 ):
     """Stage 1 of split-K flash decoding.
 
@@ -289,16 +296,15 @@ def _tile2_split_decode_kernel(
     lo = sp * per
     hi = tl.minimum(lo + per, ntiles)
     for ti in range(lo, hi):
-        # Same rule as the non-split kernel: `packed_ntiles` (nc) counts what THIS request flushed,
-        # and a request that inherited a prefix from the radix cache never flushed those tiles, so
-        # `ti < nc` sends the whole inherited prefix down the landing-window path. Ask the store's
-        # own routing entry for the tile's first row instead. (This path is the one production uses:
-        # the delivered config runs SPLITS=8, so fixing only the non-split kernel changed nothing.)
-        _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
-        _pos0 = ti * T
-        _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
-        _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
-        packed = _sr0 >= 0
+        # See the non-split kernel for why this is a launch-time choice.
+        if USE_SROW:
+            _rid0 = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
+            _pos0 = ti * T
+            _s0 = tl.load(POS + _rid0 * RSTR + _pos0, mask=_pos0 < n, other=-1).to(tl.int64)
+            _sr0 = tl.load(SROW + _s0, mask=_s0 >= 0, other=-1)
+            packed = _sr0 >= 0
+        else:
+            packed = ti < nc
         for c0 in range(0, T, BN):
             c = c0 + tl.arange(0, BN)
             posn = ti * T + c
@@ -474,6 +480,7 @@ def fused_decode_split(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         RSTR=buf.pos_slot.stride(0), H=buf.H, D=buf.D, T=buf.T,
         G=hq // buf.H, HQ=hq, BQ_=max(16, hq // buf.H), BN=bn, SPLITS=splits,
         ROT=rot_fused,
+        USE_SROW=getattr(buf, "radix_on", True),
         num_warps=int(__import__("os").environ.get("SGLANG_TILE2_WARPS", "4")),
         num_stages=int(__import__("os").environ.get("SGLANG_TILE2_STAGES", "2")),
     )
@@ -522,6 +529,7 @@ def fused_decode(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         # tl.dot needs M >= 16 on this hardware, so the tile is padded from G to 16. Using
         # G here is rejected at compile time; the padding is the price of the MMA path.
         G=hq // buf.H, HQ=hq, BQ_=max(16, hq // buf.H), BN=bn,
+        USE_SROW=getattr(buf, "radix_on", True),
     )
     try:
         from sglang.srt.mem_cache.tile2_store import _prof_add as _pa
