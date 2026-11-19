@@ -301,6 +301,11 @@ class Tile2Buffers:
         #: per-request decision has to come from a device tensor. The tables below are filled by the
         #: PREFILL path (which is never captured) and only read during decode.
         self.graphsafe = os.environ.get("SGLANG_TILE2_GRAPH") == "1"
+        #: Whether prefixes can be shared, i.e. whether a tile may outlive the request that wrote
+        #: it. Set by model_runner from `--disable-radix-cache` (as an env var, because the pool is
+        #: built later than server_args is parsed). Defaults to True: the reference-aware reclaim is
+        #: the safe choice, and only radix-off runs may skip it.
+        self.radix_on = os.environ.get("SGLANG_TILE2_RADIX_ON", "1") != "0"
         self.stg_tab = None
         self.base_tab = None
         self.pos_slot = None  # [req_rows, max_ctx] device position->slot table
@@ -440,7 +445,9 @@ class Tile2Buffers:
             return
         still = []
         for start, k in self._deferred_blocks:
-            if self._block_referenced(start, k):
+            # Only the radix cache can keep a tile alive past the request that produced it; with it
+            # off the reference check is wrong (see free_tile_block).
+            if getattr(self, "radix_on", True) and self._block_referenced(start, k):
                 still.append((start, k))
             else:
                 self._blocks.append((start, k))
@@ -455,7 +462,12 @@ class Tile2Buffers:
         lo, hi = start, start + k
         for key in [t for t in self._param_owner if lo <= t[1] < hi]:
             del self._param_owner[key]
-        if self._block_referenced(start, k):
+        # Only the radix cache can keep a tile alive past the request that produced it. With it
+        # off there is no sharing, so a block is free the moment its request ends -- and the
+        # reference check is then WRONG, because a freed slot keeps its packed `slot_row` entry
+        # until some future request happens to reuse it. Measured: an n=200 radix-off run died at
+        # 169/200 with "no free block (3278 deferred)".
+        if getattr(self, "radix_on", True) and self._block_referenced(start, k):
             # Someone still reads through these tiles (a shared prefix). Keep the block out of the
             # free list until the last reference is gone; `alloc_tile_block` retries the queue.
             self._deferred_blocks.append((start, k))
@@ -1293,8 +1305,15 @@ class Tile2Driver:
             # Sized by concurrent requests, not by the request-pool row count: the table only has
             # to hold the requests that are live at once, and 4096 rows cost 268 MB of the KV
             # budget (that showed up as capacity 499,718 -> 486,613 tokens).
-            b.pos_slot = torch.full((REQ_SLOTS, r2t.shape[1]), -1,
+            b.pos_slot = torch.full((REQ_SLOTS + 1, r2t.shape[1]), -1,
                                     dtype=torch.int32, device=b.device)
+            # CUDA-graph padding support. `replay_prepare` writes `pad_sentinel` into the padded
+            # rows' `out_cache_loc`, and padded tokens are REDIRECTED to these dustbin rows rather
+            # than filtered out -- filtering needs `nonzero`, whose data-dependent shape capture
+            # rejects. The extra pos_slot row and the last staging row are never read by anyone.
+            b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
+            b.dustbin_pos_row = int(REQ_SLOTS)
+            b.dustbin_stg_row = int(b.max_staging * b.T - 1)
         if b.ridx_tab is None:
             b.ridx_tab = torch.zeros((r2t.shape[0],), dtype=torch.int32, device=b.device)
         if b.packed_ntiles is None:
@@ -1358,8 +1377,15 @@ class Tile2Driver:
             # Sized by concurrent requests, not by the request-pool row count: the table only has
             # to hold the requests that are live at once, and 4096 rows cost 268 MB of the KV
             # budget (that showed up as capacity 499,718 -> 486,613 tokens).
-            b.pos_slot = torch.full((REQ_SLOTS, r2t.shape[1]), -1,
+            b.pos_slot = torch.full((REQ_SLOTS + 1, r2t.shape[1]), -1,
                                     dtype=torch.int32, device=b.device)
+            # CUDA-graph padding support. `replay_prepare` writes `pad_sentinel` into the padded
+            # rows' `out_cache_loc`, and padded tokens are REDIRECTED to these dustbin rows rather
+            # than filtered out -- filtering needs `nonzero`, whose data-dependent shape capture
+            # rejects. The extra pos_slot row and the last staging row are never read by anyone.
+            b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
+            b.dustbin_pos_row = int(REQ_SLOTS)
+            b.dustbin_stg_row = int(b.max_staging * b.T - 1)
         if b.ridx_tab is None:
             b.ridx_tab = torch.zeros((r2t.shape[0],), dtype=torch.int32, device=b.device)
         if b.stg_tab is None:
@@ -1372,11 +1398,30 @@ class Tile2Driver:
         pre = fb.seq_lens.to(torch.long) - 1
         T = b.T
         fill = pre % T
+        # CUDA-graph batch padding. When the true batch size is not an exactly captured one,
+        # `cuda_graph_runner.replay_prepare` pads up to the next captured size, fills the padded
+        # rows' `seq_lens` with the backend's fill value and zeroes their `out_cache_loc`; the
+        # padded rows' `req_pool_indices` are left STALE. Everything below indexes per-row tables,
+        # so a padded row would steer a write into whatever live request happens to own that stale
+        # row: its landing-window rows get dummy KV, its position table gets a bogus entry, and
+        # `closed_mask` flags it for a flush. Measured: padding on 40.5% vs off 71.0% on MATH500
+        # n=200, with no error anywhere.
+        #
+        # The marker is a dedicated sentinel that `replay_prepare` writes into the padded
+        # `out_cache_loc` entries (see install()): a spare KV slot no request can ever own. Padded
+        # tokens are then REDIRECTED to dustbin rows instead of being filtered out, because
+        # filtering would need `nonzero` -- a data-dependent shape, which capture rejects.
+        sent = getattr(b, "pad_sentinel", None)
+        if sent is not None:
+            valid = loc != sent
+        else:
+            valid = torch.ones_like(loc, dtype=torch.bool)
         stg = b.stg_tab.index_select(0, rows)
-        if (not torch.cuda.is_current_stream_capturing()) and bool((stg < 0).any()):
+        if (not torch.cuda.is_current_stream_capturing()) and bool(((stg < 0) & valid).any()):
             raise RuntimeError("[TILE2] decode reached a row with no staging slot; the routing "
                                "tables are only filled by the prefill path")
-        src = stg * T + fill
+        src = torch.where(valid, stg * T + fill, torch.full_like(stg * T + fill,
+                                                                b.dustbin_stg_row))
         # k/v arrive ALREADY rotated: the wrapper rotates them when rot_domain is on, and the
         # host write path is told `rotate=False` for exactly that reason. Rotating again here was
         # a double rotation and made the whole decode store wrong (0/8 with CUDA graphs).
@@ -1389,7 +1434,10 @@ class Tile2Driver:
                 raise RuntimeError("[TILE2] position table missing in graph-safe mode")
             # ridx (per-request compact index), NOT the row: the two diverge after a
             # chunked-prefill row change, and using the row silently loses the whole history.
-            b.pos_slot.index_put_((b.ridx_tab.index_select(0, rows), pre), loc.to(torch.int32))
+            _ri = b.ridx_tab.index_select(0, rows)
+            if sent is not None:
+                _ri = torch.where(valid, _ri, torch.full_like(_ri, b.dustbin_pos_row))
+            b.pos_slot.index_put_((_ri, pre), loc.to(torch.int32))
         # mark rows whose tile just closed, for the post-forward flush
         if b.closed is None or b.closed.shape[1] < rows.numel():
             b.closed = torch.full((b.L, max(4096, int(rows.numel()))), -1,
@@ -1405,7 +1453,9 @@ class Tile2Driver:
             b.closed_mask = torch.zeros((b.L, max(4096, bs)), dtype=torch.bool, device=b.device)
         m = b.closed_mask[li]
         m.fill_(False)
-        m[:bs].copy_(fill == (T - 1))
+        # A padded row must never be reported as a closed tile: `flush_deferred` would quantise a
+        # tile for whatever request owns that stale row.
+        m[:bs].copy_((fill == (T - 1)) & valid)
 
     def flush_deferred(self, fb) -> None:
         """Quantise every tile that a decode step closed. Runs OUTSIDE the captured graph."""

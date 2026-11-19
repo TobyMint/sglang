@@ -1362,6 +1362,12 @@ class ModelRunner:
                     "every batch size so padding never happens (--cuda-graph-bs 1 2 3 4 5 6 7 8); "
                     "the latter costs ~200 MB of VRAM and keeps full graph coverage. "
                     "Set SGLANG_TILE2_ALLOW_PADDING=1 to run anyway.")
+            # Free tile blocks immediately unless prefixes can actually be shared: with the radix
+            # cache off the store's reference check never clears and the pool drains (measured:
+            # n=200 radix-off died at 166/200 with "no free block"). The pool does not exist yet at
+            # this point, so the flag travels as an env var and is read when the buffer is built.
+            __import__("os").environ["SGLANG_TILE2_RADIX_ON"] = (
+                "0" if self.server_args.disable_radix_cache else "1")
             _n = self.server_args.tile2_concurrency
             if _n is None and max_num_reqs is None:
                 # OPT-IN ONLY. Deriving a concurrency when the user said nothing looked tidy, but
