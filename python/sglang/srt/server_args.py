@@ -418,6 +418,21 @@ class ServerArgs:
         #   staging        = N + 2   (one retire-lag slot + one spare; see `_tile2_staging_slots`)
         #   max_running_requests = N  (the hard bound; `get_num_allocatable_reqs` uses it)
         #   cuda_graph_max_bs    = N  (a request above the largest captured batch cannot be graphed)
+        # packed_tile2 keeps no bf16 KV: `self.k_buffer = []`, the payload lives in packed 2.5-bit
+        # tiles. HiCache's host pool (MHATokenToKVPoolHost) allocates a DENSE host buffer and asserts
+        # host_size > device_size, so the two are structurally incompatible -- measured failure:
+        #   hiradix_cache.py:57 -> memory_pool_host.py:283
+        #   AssertionError: The host memory should be larger than the device memory ...
+        # Fail here with an explanation instead of that assertion, and instead of silently serving
+        # without a hierarchy.
+        if self.kv_cache_dtype == "packed_tile2" and getattr(self, "enable_hierarchical_cache", False):
+            raise ValueError(
+                "packed_tile2 does not support --enable-hierarchical-cache yet: the tile store "
+                "keeps no dense bf16 KV buffer, while HiCache's host pool allocates dense bf16 and "
+                "asserts host > device size. Supporting it needs a tile-granular offload path "
+                "(packed bytes + the 8 parameter planes per tile as an opaque block); see "
+                "results/*hicache* in the project notes."
+            )
         if self.tile2_concurrency is not None:
             _n = int(self.tile2_concurrency)
             if self.max_running_requests is None:
