@@ -109,12 +109,24 @@ class PackedTile2KVPoolHost(HostKVCache):
             return t[page]
         return t[page * self.page_size:(page + 1) * self.page_size]
 
-    def backup_from_device_all_layer(self, device_pool, device_indices, host_indices, stream=None):
-        """D2H: copy every field of these device pages into host pages. Byte copy, no conversion."""
+    def backup_from_device_all_layer(self, device_pool, host_indices, device_indices,
+                                     io_backend=None):
+        """D2H: copy every field of these device pages into host pages. Byte copy, no conversion.
+
+        ARGUMENT ORDER matters and is the one HiCacheController uses (`device_pool, host_indices,
+        device_indices, io_backend`). The first version had the two index tensors swapped; it did
+        not crash because both are integers in overlapping ranges, it silently wrote every page to
+        the wrong host slot. The range assertions below exist so a swap fails loudly instead.
+        """
         host_indices = host_indices.tolist() if torch.is_tensor(host_indices) else host_indices
         device_indices = device_indices.tolist() if torch.is_tensor(device_indices) else device_indices
-        with _stream_ctx(stream):
-            for d_idx, h_idx in zip(device_indices, host_indices):
+        assert len(host_indices) == len(device_indices), (len(host_indices), len(device_indices))
+        if host_indices:
+            assert max(host_indices) < self.size, ("host index out of range", max(host_indices), self.size)
+            assert max(device_indices) < self.buf.slots, ("device index out of range",
+                                                          max(device_indices), self.buf.slots)
+        with _stream_ctx(io_backend):
+            for h_idx, d_idx in zip(host_indices, device_indices):
                 d_page = int(d_idx) // self.page_size
                 h_page = int(h_idx) // self.page_size
                 for li in range(self.layer_num):
@@ -129,16 +141,25 @@ class PackedTile2KVPoolHost(HostKVCache):
                 print("[TILE2-HOST] backup: %d calls, %d pages offloaded"
                       % (self.n_backup_calls, self.n_backup_pages), flush=True)
 
-    def load_to_device_per_layer(self, device_pool, device_indices, host_indices, layer_id,
-                                 stream=None):
-        """H2D for ONE layer. Returns the number of tokens restored (HiCache's completion protocol)."""
+    def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id,
+                                 io_backend=None):
+        """H2D for ONE layer. Returns the number of tokens restored.
+
+        Same argument order as `backup_from_device_all_layer` (host first), and same range
+        assertions so a swap cannot silently restore the wrong page.
+        """
         host_indices = host_indices.tolist() if torch.is_tensor(host_indices) else host_indices
         device_indices = device_indices.tolist() if torch.is_tensor(device_indices) else device_indices
+        assert len(host_indices) == len(device_indices), (len(host_indices), len(device_indices))
+        if host_indices:
+            assert max(host_indices) < self.size, ("host index out of range", max(host_indices), self.size)
+            assert max(device_indices) < self.buf.slots, ("device index out of range",
+                                                          max(device_indices), self.buf.slots)
         li = int(layer_id) - self.start_layer
         if not (0 <= li < self.layer_num):
             return 0
-        with _stream_ctx(stream):
-            for d_idx, h_idx in zip(device_indices, host_indices):
+        with _stream_ctx(io_backend):
+            for h_idx, d_idx in zip(host_indices, device_indices):
                 d_page = int(d_idx) // self.page_size
                 h_page = int(h_idx) // self.page_size
                 for name, _attr, _per_tile in self.FIELD_SRC:
