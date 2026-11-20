@@ -130,6 +130,13 @@ class HiRadixCache(RadixCache):
             1 if hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        #: SGLANG_TILE2_HCDBG=1 prints the node state machine, because "offload happened" (bytes were
+        #: copied) and "the tree knows the node is on host" (evicted=True + host_value) are different
+        #: things, and only the second one can ever produce a load back.
+        import os as _os
+        self._t2dbg = _os.environ.get("SGLANG_TILE2_HCDBG") == "1"
+        self._t2 = {"wb": 0, "wb_ok": 0, "wc": 0, "ack": 0, "ev_reg": 0, "ev_bak": 0,
+                    "host_hit": 0, "load_back": 0}
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
         )
@@ -169,7 +176,18 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _t2count(self, name, n=1):
+        if not getattr(self, "_t2dbg", False):
+            return
+        self._t2[name] = self._t2.get(name, 0) + n
+        tot = sum(self._t2.values())
+        # Print early and often: the first run had a %200 window and 40 events produced no output at
+        # all, which looked exactly like "the state machine never runs".
+        if tot <= 12 or tot % 10 == 0:
+            print("[T2HC] %s" % " ".join("%s=%d" % kv for kv in self._t2.items()), flush=True)
+
     def write_backup(self, node: TreeNode, write_back=False):
+        self._t2count("wb")
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -181,6 +199,7 @@ class HiRadixCache(RadixCache):
                 node_id=node.id,
             )
         if host_indices is not None:
+            self._t2count("wb_ok")
             node.host_value = host_indices
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
@@ -211,6 +230,7 @@ class HiRadixCache(RadixCache):
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        self._t2count("wc")
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -310,12 +330,14 @@ class HiRadixCache(RadixCache):
         # evict a node already written to host
         num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
         assert num_evicted > 0
+        self._t2count("ev_bak")
         self.evictable_size_ -= num_evicted
         node.value = None
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
+        self._t2count("ev_reg")
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -614,6 +636,7 @@ class HiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
+            self._t2count("host_hit")
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
         while not last_host_node.backuped:

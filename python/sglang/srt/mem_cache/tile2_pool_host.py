@@ -162,6 +162,17 @@ class PackedTile2KVPoolHost(HostKVCache):
             for h_idx, d_idx in zip(host_indices, device_indices):
                 d_page = int(d_idx) // self.page_size
                 h_page = int(h_idx) // self.page_size
+                # The destination page is a NEW device page: its slot map and its read-ready state
+                # belong to whoever used those slots before, and the dequant path derives the tile
+                # from `slot_row`. Copying the ten tensors without restoring this made the reloaded
+                # KV readable through a stale mapping -- the one failure mode that produces
+                # plausible-but-wrong output instead of an error.
+                sl = torch.arange(d_page * self.page_size, (d_page + 1) * self.page_size,
+                                  dtype=torch.long, device=self.buf.slot_row.device)
+                self.buf.slot_row[sl] = sl.to(self.buf.slot_row.dtype)
+                self.buf.page_ready_layers[d_page] = int(self.buf._layers_mask)
+                self.buf.page_generation[d_page] += 1
+                assert int(self.buf.slot_row[int(sl[0])]) == int(sl[0]), "slot_row restore failed"
                 for name, _attr, _per_tile in self.FIELD_SRC:
                     off, nbytes, shape, dt = self.spec.offsets[name]
                     dst = self._field_slice(li, name, d_page)
