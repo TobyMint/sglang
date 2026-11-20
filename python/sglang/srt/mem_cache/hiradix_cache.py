@@ -53,7 +53,20 @@ class HiRadixCache(RadixCache):
                 )
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        if getattr(self.kv_cache, "is_packed_tile2", False):
+            # A packed tile is ten tensors, not a dense bf16 [L,size,H,D] buffer, so the MHA host
+            # pool cannot describe it (it asserts host_tokens > device_tokens on bf16 density and
+            # then indexes an empty k_buffer). The packed host pool stores the page bytes verbatim.
+            from sglang.srt.mem_cache.tile2_pool_host import PackedTile2KVPoolHost
+
+            self.token_to_kv_pool_host = PackedTile2KVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+                hicache_mem_layout,
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 hicache_ratio,

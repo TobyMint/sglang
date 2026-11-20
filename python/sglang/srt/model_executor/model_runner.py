@@ -1325,7 +1325,8 @@ class ModelRunner:
             # Decide the three coupled numbers BEFORE profiling: the profiler subtracts the
             # landing window from the budget, and max_num_reqs is what the scheduler will see.
             if (not self.server_args.disable_radix_cache
-                    and __import__("os").environ.get("SGLANG_TILE2_ALLOW_RADIX") != "1"):
+                    and __import__("os").environ.get("SGLANG_TILE2_ALLOW_RADIX") != "1"
+                    and __import__("os").environ.get("SGLANG_TILE2_PAGE_BOUND") != "1"):
                 # Escape hatch for the compatibility experiment only: with radix cache on, one KV
                 # slot can be shared by several requests, and this store's tile ownership assumes
                 # one owner per tile. Set SGLANG_TILE2_ALLOW_RADIX=1 to measure what actually
@@ -1334,7 +1335,9 @@ class ModelRunner:
                     "packed_tile2 does not support the radix cache: a shared prefix is packed "
                     "once and then read by later requests, while tile ownership and "
                     "packed_ntiles assume one owner per tile, so results would be silently "
-                    "wrong. Add --disable-radix-cache.")
+                    "wrong. Add --disable-radix-cache. (Page-bound mode, i.e. HiCache, is the "
+                    "exception: there a tile IS a device page, so ownership is the allocator's, "
+                    "shared prefixes included.)")
             # Padding only bites when the true batch size is not an exactly captured one:
             # `cuda_graph_runner.replay_prepare` does `bisect_left(capture_bs, raw_bs)` and pads up
             # to `capture_bs[index]`, zeroing `out_cache_loc` for the padded rows. Skipping the pad

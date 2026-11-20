@@ -426,13 +426,25 @@ class ServerArgs:
         # Fail here with an explanation instead of that assertion, and instead of silently serving
         # without a hierarchy.
         if self.kv_cache_dtype == "packed_tile2" and getattr(self, "enable_hierarchical_cache", False):
-            raise ValueError(
-                "packed_tile2 does not support --enable-hierarchical-cache yet: the tile store "
-                "keeps no dense bf16 KV buffer, while HiCache's host pool allocates dense bf16 and "
-                "asserts host > device size. Supporting it needs a tile-granular offload path "
-                "(packed bytes + the 8 parameter planes per tile as an opaque block); see "
-                "results/*hicache* in the project notes."
-            )
+            # Supported, but only in the page-bound configuration: one quantised tile == one device
+            # token page == one host page. The host pool then stores the packed bytes verbatim, so
+            # an offload/onload round trip is exact (no dequantise/requantise).
+            import os as _os
+            if self.page_size in (None, 1):
+                self.page_size = 128
+                print("[TILE2] hierarchical cache: forcing --page-size 128 (= one tile per page)",
+                      flush=True)
+            if int(self.page_size) != 128:
+                raise ValueError(
+                    "packed_tile2 + --enable-hierarchical-cache requires --page-size 128 (one tile "
+                    "per page); got %s. A different page size would split a tile's codes from its "
+                    "parameters across two host pages." % self.page_size)
+            _os.environ["SGLANG_TILE2_PAGE_BOUND"] = "1"
+            if self.hicache_io_backend not in (None, "direct"):
+                raise ValueError(
+                    "packed_tile2 + --enable-hierarchical-cache supports --hicache-io-backend "
+                    "direct only for now (got %r); the kernel and storage backends assume dense "
+                    "bf16 KV." % self.hicache_io_backend)
         if self.tile2_concurrency is not None:
             _n = int(self.tile2_concurrency)
             if self.max_running_requests is None:
