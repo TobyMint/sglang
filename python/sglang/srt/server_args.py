@@ -410,6 +410,25 @@ class ServerArgs:
     enable_flashinfer_mxfp4_moe: bool = False
 
     def __post_init__(self):
+        # ---- packed_tile2: ONE knob for concurrency -------------------------------------------
+        # The staging slots, the scheduler's live-request bound and the captured CUDA-graph batch
+        # sizes are three views of the same number, and getting them out of sync is exactly how
+        # "8 concurrent requests" ended up needing 24 pre-allocated slots. So `--tile2-concurrency
+        # N` sets all of them unless the operator overrode that particular flag:
+        #   staging        = N + 2   (one retire-lag slot + one spare; see `_tile2_staging_slots`)
+        #   max_running_requests = N  (the hard bound; `get_num_allocatable_reqs` uses it)
+        #   cuda_graph_max_bs    = N  (a request above the largest captured batch cannot be graphed)
+        if self.tile2_concurrency is not None:
+            _n = int(self.tile2_concurrency)
+            if self.max_running_requests is None:
+                self.max_running_requests = _n
+            elif int(self.max_running_requests) != _n:
+                raise ValueError(
+                    "--tile2-concurrency %d conflicts with --max-running-requests %s; for "
+                    "packed_tile2 they must agree (one staging slot per live request)"
+                    % (_n, self.max_running_requests))
+            if not self.disable_cuda_graph and (self.cuda_graph_max_bs or 0) < _n:
+                self.cuda_graph_max_bs = _n
         # Check deprecated arguments
         if self.enable_ep_moe:
             self.ep_size = self.tp_size

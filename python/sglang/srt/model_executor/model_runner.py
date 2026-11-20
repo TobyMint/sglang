@@ -1386,12 +1386,17 @@ class ModelRunner:
                     % (_n, max_num_reqs))
             if _n is not None:
                 self._tile2_concurrency = _n
-                # 2N + 2, not N + 2: a step can admit N fresh requests while the previous N still
-                # hold their slots, and the reclaimer may only take a slot untouched for 32 steps.
-                # Measured with N+2: an n=200 run died on problem 5 with "all 10 staging slots
-                # belong to requests in the current batch". (This is also why the long-standing
-                # "24 slots for 8 concurrent" happened to be safe -- 24 is about 3N.)
-                self._tile2_staging = 2 * _n + 2
+                # N + 2, not the old 2N + 2. That 2N+2 came from the guessing reclaimer ("a slot
+                # untouched for 32 steps may be recycled"), which recycled LIVE requests and still
+                # ran out under short prompts. With the lifecycle hook (retire on request end) the
+                # requirement is measured, not guessed:
+                #   N slots  -> crashes: the scheduler can have N running + 1 freshly admitted
+                #   N + 1    -> sufficient in three independent runs (MMLU 200 acc 0.725,
+                #               MATH500 200 acc 0.845, radix-on n=50 acc 0.800), 0 crashes
+                #   N + 2    -> same numbers, one spare slot (18 MB = ~655 tokens, i.e. 0.13% of
+                #               the pool) which is cheap insurance against a 2-step retire lag
+                # Default is N + 2 because the margin costs almost nothing.
+                self._tile2_staging = _n + 2
                 # Do NOT shrink the request-row pool here. `max_num_reqs` also sizes
                 # `req_to_token_pool`, and this store's bookkeeping is row-keyed
                 # (`_row_key`, `stg_tab`, `pos_slot` via `ridx_tab`): with only N rows every new

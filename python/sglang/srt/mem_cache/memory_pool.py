@@ -72,14 +72,29 @@ def _tile2_staging_slots(pool) -> int:
     env = _os.environ.get("SGLANG_TILE2_STAGING")
     if env:
         return int(env)
+    # The scheduler's hard bound on how many requests can be live at once is
+    # `global_server_args_dict["max_micro_batch_size"]` (it defaults to max_running_requests, and
+    # `get_num_allocatable_reqs` is literally `max_micro_batch_size - running_bs`). Using
+    # `pool.server_args` was wrong -- the pool does not carry it, so the derivation silently fell
+    # back to 8 and would under-provision any deployment that raises the batch bound.
+    from sglang.srt.managers.schedule_batch import global_server_args_dict as _g
     conc = None
-    for attr in ("tile2_concurrency", "max_running_requests"):
-        v = getattr(getattr(pool, "server_args", None), attr, None)
+    for k in ("tile2_concurrency", "max_micro_batch_size"):
+        v = _g.get(k)
         if v:
             conc = int(v)
             break
-    if not conc:
-        conc = 8          # matches the default cuda-graph batch bound on this GPU class
+    # `max_micro_batch_size` defaults to max_running_requests, which is derived from the token pool
+    # and is typically thousands. Sizing buffers from that would allocate 4000+ slots (73 GB), so a
+    # huge/derived value means "the operator did not tell us the real concurrency": fall back to the
+    # 8-way assumption instead of exploding.
+    if not conc or conc > 64:
+        print("[TILE2] no explicit --tile2-concurrency (or bound > 64); staging defaults to 9 "
+              "slots = support for 8 concurrent requests. Pass --tile2-concurrency N to serve "
+              "N-way (staging becomes N+2).", flush=True)
+        return 9
+    # +1 covers the one-step lag: a request that just ended keeps its slot until the next
+    # `drain_retires` (measured: 8 slots died, 9 survived with an 8-way client).
     return max(1, conc + 1)
 
 
