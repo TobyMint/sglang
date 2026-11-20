@@ -1,0 +1,225 @@
+"""Live tile-closure lifecycle for the `qdq_q*bR*` recipes.
+
+The stateless QDQ hook in `kv_qdq.py` cannot form a 128-token tile across calls, so decode
+writes stay at BF16 for the whole generation. These recipes replace it with the closure engine
+(`tile_closure.py` / `closure_driver.py`): after each layer's KV write and before the attention
+read of that layer, every tile that has just closed is gathered by the request's logical
+position map, quantised, and scattered back in place.
+
+Ordering matters and is enforced by construction: this wrapper runs *inside* the backend's
+forward, immediately after the pool write, on the same stream, so the attention read that
+follows sees quantised rows. A Python-level return is not what provides that guarantee - the
+stream order is.
+
+State keys are the request-pool rows (`req_pool_indices`). A row is stable for the lifetime of a
+request and is recycled afterwards. Generation identity comes from
+`ReqToTokenPool.alloc/free` (a monotonic per-row allocation count); length and the position-0 slot
+are only fallbacks for offline tests, because neither alone can identify a recycled row
+(an external reviewer produced counter-examples for both).
+"""
+from __future__ import annotations
+
+import os
+from typing import Dict, Optional
+
+_RECIPES = {
+    "q2r0": (2, 0),
+    "q2r128": (2, 128),
+    "q4r0": (4, 0),
+    "q4r128": (4, 128),
+    # KVarN's recipe (Hadamard + dual-axis VarN) driven by the closure lifecycle.
+    # The codebook tuple is (bits, recent); the quantiser is selected in build().
+    "kv2r0": (2, 0),
+    "kv2r128": (2, 128),
+    "kv4r0": (4, 0),
+    "kv4r128": (4, 128),
+    # policy-intervention arm: no cross-step closure (tiles only inside one write).
+    # NOT a faithful reproduction of the old stateless hook - see tile_closure.py.
+    "kv2pw0": (2, 0),
+    "kv4pw0": (4, 0),
+    # diagnostics: same lifecycle, near-lossless and mid width, to separate plumbing from quality
+    "q8r0": (8, 0),
+    "q6r0": (6, 0),
+}
+
+_DRV = None
+_STATE: Dict[str, object] = {"fb": None, "ids": None, "lens": None, "gens": None}
+#: row -> allocation count. Bumped on every ReqToTokenPool.alloc, so a recycled row is a new
+#: generation even when it is handed the SAME slot index again.
+_GEN: Dict[int, int] = {}
+_INSTALLED = False
+
+
+def is_lifecycle_recipe(recipe: str) -> bool:
+    name = recipe[len("qdq_"):] if recipe.startswith("qdq_") else recipe
+    return name in _RECIPES
+
+
+def build(recipe: str):
+    """Called from KVQDQ build(): install the closure driver instead of the stateless hook."""
+    global _DRV
+    name = recipe[len("qdq_"):] if recipe.startswith("qdq_") else recipe
+    if name not in _RECIPES:
+        return None
+    bits, recent = _RECIPES[name]
+    from sglang.srt.mem_cache.closure_driver import ClosureDriver
+    tile_quant = None
+    if name.startswith("kv"):
+        # KVarN: one joint quantiser per tile (K and V share VarN but use different scale axes)
+        from sglang.srt.mem_cache.kvarn_tile import make_kvarn_quantizer
+        tile_quant = make_kvarn_quantizer(bits=bits, iters=8)
+    per_write = name.endswith("pw0")
+    import os as _os2
+    _COUNT_UNALIGNED = _os2.environ.get("I4LIFE_COUNT_UNALIGNED") == "1"
+    _DRV = ClosureDriver(T=128, sink=0, recent=recent, bits=bits, group=32,
+                         tile_quant=tile_quant, per_write=per_write)
+    _DRV.count_unaligned = _COUNT_UNALIGNED
+    if _COUNT_UNALIGNED:
+        import atexit as _atexit
+        _atexit.register(lambda: print(
+            f"[I4LIFE] unaligned multi-tile writes (loose vs strict per_write differ): "
+            f"{getattr(_DRV, 'unaligned_writes', 0)}", flush=True))
+    _install()
+    life = ("per_write(policy: no cross-step closure; decode writes NOT quantised)"
+            if per_write else "closure (decode KV IS quantised)")
+    print(f"[I4LIFE] recipe={name} bits={bits} recent={recent} T=128 sink=0 "
+          f"quant={'kvarn(hadamard+varn8+rtn)' if tile_quant else 'rtn'} "
+          f"lifecycle={life}", flush=True)
+    return None                      # the stateless hook must not run alongside
+
+
+def _batch_ctx(forward_batch):
+    """Cache the host-side batch metadata once per scheduler step.
+
+    `forward_batch` is the same object for every layer of one step, so the two device->host
+    copies happen once per step, not once per layer. CUDA graphs are off for these recipes,
+    which is what makes the object identity a valid key.
+    """
+    if _STATE["fb"] is not forward_batch:
+        _STATE["fb"] = forward_batch
+        _STATE["ids"] = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        _STATE["lens"] = [int(x) for x in forward_batch.seq_lens.tolist()]
+    return _STATE["ids"], _STATE["lens"]
+
+
+def _run_layer(layer, forward_batch) -> None:
+    if _DRV is None or forward_batch is None:
+        return
+    pool = forward_batch.token_to_kv_pool
+    if pool is None or getattr(pool, "is_packed_int4", False):
+        return                        # this path is the BF16-storage measurement hook only
+    r2t_pool = getattr(forward_batch, "req_to_token_pool", None)
+    if r2t_pool is None:
+        raise RuntimeError("[I4LIFE] forward_batch has no req_to_token_pool; "
+                           "cannot map logical positions to slots")
+    kb, vb = pool.get_kv_buffer(layer.layer_id)
+    ids, lens = _batch_ctx(forward_batch)
+    gens = [_GEN.get(int(r), 0) for r in ids]
+    _DRV.step(layer.layer_id, ids, lens, r2t_pool.req_to_token, kb, vb,
+              req_rows=ids, gens=gens)
+
+    # runtime invariant: nothing may be closed-but-unapplied before this layer's read
+    for rid in ids:
+        pend = _DRV.pending(rid, layer.layer_id)
+        if pend:
+            raise RuntimeError(f"[I4LIFE] request {rid} layer {layer.layer_id} has "
+                               f"closed-but-unapplied tiles {pend[:4]} before the attention read")
+
+    # --- coverage trajectory (env-gated, one CSV line per active request per sample) --------
+    _STATE["n"] = int(_STATE.get("n", 0)) + 1
+    _cov_path = os.environ.get("I4LIFE_DUMP")
+    if _cov_path:
+        _STATE["covf"] = _STATE.get("covf") or open(_cov_path, "a", buffering=1)
+        for _rid in ids:
+            _c = _DRV.coverage(_rid, layer.layer_id)
+            _STATE["covf"].write(
+                f"{_STATE['n']},{layer.layer_id},{_rid},{_c['L']},{_c['quantised']},"
+                f"{_c['bf16_positions']},{_c['closed']},{_c['pending']},{_c['c']:.6f}\n")
+
+    if _STATE["n"] % 36 == 0:
+        rep = []
+        for rid in ids[:4]:
+            c = _DRV.coverage(rid, 0)          # layer 0 as the reporting layer
+            rep.append(f"req{rid}:L={c['L']},q={c['quantised']},c={c['c']:.2f},"
+                       f"closed={c['closed']},pend={c['pending']}")
+        print(f"[I4SMOKE] steps={_STATE['n']} " + " | ".join(rep), flush=True)
+
+
+def _install() -> None:
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    orig_decode = FlashInferAttnBackend.forward_decode
+    orig_extend = FlashInferAttnBackend.forward_extend
+
+    def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True):
+        # stash the batch so the wrapped set_kv_buffer can see it; clear afterwards so a layer
+        # outside a forward pass cannot accidentally use a stale batch
+        _STATE["cur_fb"] = forward_batch
+        try:
+            return orig_decode(self, q, k, v, layer, forward_batch, save_kv_cache)
+        finally:
+            _STATE["cur_fb"] = None
+
+    def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True):
+        _STATE["cur_fb"] = forward_batch
+        try:
+            return orig_extend(self, q, k, v, layer, forward_batch, save_kv_cache)
+        finally:
+            _STATE["cur_fb"] = None
+
+    FlashInferAttnBackend.forward_decode = forward_decode
+    FlashInferAttnBackend.forward_extend = forward_extend
+
+    orig_set = MHATokenToKVPool.set_kv_buffer
+
+    def set_kv_buffer(self, layer, loc, k, v, k_scale=None, v_scale=None,
+                      layer_id_override=None):
+        orig_set(self, layer, loc, k, v, k_scale, v_scale, layer_id_override)
+        fb = _STATE.get("cur_fb")
+        if fb is not None and fb.token_to_kv_pool is self:
+            _run_layer(layer, fb)
+
+    MHATokenToKVPool.set_kv_buffer = set_kv_buffer
+
+    # --- authoritative request lifecycle: bump the generation on alloc, drop state on free -----
+    try:
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        _orig_alloc = ReqToTokenPool.alloc
+        _orig_free = ReqToTokenPool.free
+
+        def alloc(self, need_size):
+            rows = _orig_alloc(self, need_size)
+            for r in rows:
+                _GEN[int(r)] = _GEN.get(int(r), 0) + 1
+            return rows
+
+        def free(self, free_index):
+            rows = free_index if isinstance(free_index, (list, tuple)) else [free_index]
+            out = _orig_free(self, free_index)
+            if _DRV is not None:
+                for r in rows:
+                    # Do NOT drop the counter here: keeping it makes the id monotonic across
+                    # reuse (1 -> 2 -> 3 ...). Dropping it would let a recycled row restart at 1,
+                    # which is exactly the ambiguity this mechanism exists to remove.
+                    _DRV.finish(int(r))          # raises on bookkeeping errors; do not swallow
+            return out
+
+        ReqToTokenPool.alloc = alloc
+        ReqToTokenPool.free = free
+        print("[I4LIFE] generation ids wired to ReqToTokenPool.alloc/free", flush=True)
+    except Exception as _e:
+        # These experiments REQUIRE generation ids. A silent fallback would pass gens=[0,...]
+        # anyway, so fail loudly instead of pretending to work.
+        print(f"[I4LIFE] FATAL: could not wire generation ids to ReqToTokenPool ({_e}); "
+              f"refusing to run with an unreliable lifecycle", flush=True)
+        raise
+
+    _INSTALLED = True
+
+
+def driver():
+    return _DRV
