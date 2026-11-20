@@ -59,6 +59,12 @@ class PackedTile2KVPoolHost(HostKVCache):
         super().__init__(device_pool, host_to_device_ratio, host_size, page_size, layout,
                          pin_memory, device)
         self.n_pages = self.size // self.page_size
+        #: Transfer accounting. Acceptance for the HiCache work requires proving that migrations
+        #: actually happened (`> 0`), not just that they would be correct.
+        self.n_backup_pages = 0
+        self.n_load_pages = 0
+        self.n_backup_calls = 0
+        self.n_load_calls = 0
         assert self.kv_buffer.shape == (self.layer_num, self.n_pages, self.spec.page_bytes), (
             self.kv_buffer.shape, (self.layer_num, self.n_pages, self.spec.page_bytes))
 
@@ -117,6 +123,11 @@ class PackedTile2KVPoolHost(HostKVCache):
                         src = self._field_slice(li, name, d_page).contiguous().view(torch.uint8).reshape(-1)
                         assert src.numel() == nbytes, (name, src.numel(), nbytes)
                         self.kv_buffer[li, h_page, off:off + nbytes].copy_(src, non_blocking=True)
+            self.n_backup_calls += 1
+            self.n_backup_pages += len(device_indices)
+            if self.n_backup_calls % 20 == 0:
+                print("[TILE2-HOST] backup: %d calls, %d pages offloaded"
+                      % (self.n_backup_calls, self.n_backup_pages), flush=True)
 
     def load_to_device_per_layer(self, device_pool, device_indices, host_indices, layer_id,
                                  stream=None):
@@ -135,6 +146,11 @@ class PackedTile2KVPoolHost(HostKVCache):
                     dst = self._field_slice(li, name, d_page)
                     dst.copy_(self.kv_buffer[li, h_page, off:off + nbytes].view(dt).reshape(shape),
                               non_blocking=True)
+        self.n_load_calls += 1
+        self.n_load_pages += len(device_indices)
+        if self.n_load_calls % 20 == 0:
+            print("[TILE2-HOST] load: %d calls, %d pages onloaded (layer %d)"
+                  % (self.n_load_calls, self.n_load_pages, li), flush=True)
         return len(device_indices)
 
     # ---- lifecycle ----------------------------------------------------------------------
@@ -143,6 +159,10 @@ class PackedTile2KVPoolHost(HostKVCache):
             return
         self.kv_buffer.zero_()
         super().clear() if hasattr(super(), "clear") else None
+
+    def transfer_report(self) -> str:
+        return ("[TILE2-HOST] transfer totals: backup %d calls/%d pages, load %d calls/%d pages"
+                % (self.n_backup_calls, self.n_backup_pages, self.n_load_calls, self.n_load_pages))
 
     def report(self) -> str:
         return ("[TILE2-HOST] %s pages=%d page_size=%d page_bytes=%d (%.0f KiB) "
