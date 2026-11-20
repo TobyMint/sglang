@@ -256,7 +256,14 @@ class Tile2Buffers:
         #: checked without the quantiser in the loop.
         self.T = int(os.environ.get("SGLANG_TILE2_T", T_TILE))
         self.max_staging = max_staging
-        self.n_tiles = (self.slots + self.T - 1) // self.T
+        #: SGLANG_TILE2_PAGE_BOUND=1 (implied by HiCache) makes a tile BE a device token page: with
+        #: `--page-size 128` the allocator hands out page-aligned runs of 128 contiguous slots, so
+        #: `tile = slot // T` is well defined and no request-level tile block is needed. The tile
+        #: then shares its lifetime with the allocator page, which is the ownership model HiCache
+        #: needs (one refcount, the allocator's).
+        self.page_bound = os.environ.get("SGLANG_TILE2_PAGE_BOUND") == "1"
+        self.n_tiles = ((self.slots // self.T) if self.page_bound
+                        else (self.slots + self.T - 1) // self.T)
         assert head_dim % 4 == 0
 
         pk = head_dim // 4
@@ -347,6 +354,12 @@ class Tile2Buffers:
         # tile ids are handed out once per closure event and shared by all layers, so the
         # allocator itself lives here; see Tile2Driver.tile_id_for.
         self._tiles_free = list(range(self.n_tiles - 1, -1, -1))
+        #: Per-page production state. `slot_row >= 0` is NOT proof that a page is complete (it is a
+        #: shared mapping that goes positive after layer 0 flushes); offload requires every local
+        #: layer's ten fields, so track a bitmask + generation per page.
+        self.page_ready_layers = torch.zeros(self.n_tiles, dtype=torch.int32, device=self.device)
+        self.page_generation = torch.zeros(self.n_tiles, dtype=torch.int32, device=self.device)
+        self._layers_mask = (1 << self.L) - 1
         #: SGLANG_TILE2_TILES_PER_REQ is how many tiles one request may use; the default covers a
         #: 16k context at T=128 and caps concurrency at n_tiles/128 requests, which is the same
         #: limit the slot pool already imposes (500k slots / 16k = 30).
@@ -655,6 +668,24 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
                 n_valid=int(n_valid))
 
 
+def tile_for_slots(buf: Tile2Buffers, tile_of, key, ti, slots):
+    """Global tile id for one group of slots.
+
+    Page-bound mode derives it from the device page the slots belong to, which is what makes a
+    tile's lifetime identical to the allocator page's. All T slots must be in ONE page, otherwise
+    the codes and their parameters would straddle two host pages.
+    """
+    if getattr(buf, "page_bound", False):
+        t = torch.unique(slots.to(torch.long) // buf.T)
+        if int(t.numel()) != 1:
+            raise RuntimeError(
+                "[TILE2] page-bound tile spans %d device pages (slots %s..%s); --page-size must "
+                "equal the tile size (%d)" % (int(t.numel()), int(slots.min()), int(slots.max()),
+                                              buf.T))
+        return int(t[0])
+    return tile_of(key, ti)
+
+
 def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
     """Write one tile's codes, its eight parameter planes and its routing entry."""
     slots, mask = ctx["slots"], ctx["mask"]
@@ -708,6 +739,13 @@ def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
         # tile as readable from codes. Incrementing before the writes would let a decode step read
         # a half-written tile.
         buf.packed_ntiles[li, key] += 1
+    if getattr(buf, "page_bound", False):
+        # This page has its ten fields for layer `li` once the writes above are enqueued. The page is
+        # usable for offload only when every local layer is present; a host sync per page (not per
+        # layer) is acceptable because it happens once per 128 tokens.
+        buf.page_ready_layers[int(tile)] |= int(1 << li)
+        if int(buf.page_ready_layers[int(tile)]) == int(buf._layers_mask):
+            buf.page_generation[int(tile)] += 1
     if count_tokens:
         # The map write happens on every layer (idempotent, and it removes the last structural
         # difference between layer 0 and the layers that read it). Counting must not: it is a
@@ -1018,7 +1056,7 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                 if _own is not None and not bool(_own.any()):
                     fill = 0          # fully inherited tile: nothing of ours to pack
                     continue
-                queue_flush(buf, li, stg, buf.T, tile_of(key, _ti), slots, update_map,
+                queue_flush(buf, li, stg, buf.T, tile_for_slots(buf, tile_of, key, _ti, slots), slots, update_map,
                             count_tokens=(li == buf.start_layer), req_row=row, key=key,
                             own_mask=_own)
                 fill = 0
@@ -1673,7 +1711,7 @@ class Tile2Driver:
                         if getattr(b, "radix_on", True) else None)
                 if _own is not None and not bool(_own.any()):
                     continue
-                queue_flush(b, li, stg, T, self.tile_of(_key0, pre // T), slots, True,
+                queue_flush(b, li, stg, T, tile_for_slots(b, self.tile_of, _key0, pre // T, slots), slots, True,
                             count_tokens=(li == b.start_layer), req_row=int(r),
                             key=_key, own_mask=_own)
             drain_flushes(b, li)
