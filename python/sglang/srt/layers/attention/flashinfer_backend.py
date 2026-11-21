@@ -724,6 +724,7 @@ class FlashInferAttnBackend(AttentionBackend):
                                self._t2f_lens[:_f], _buf.packed_ntiles[_li_f],
                                self._t2f_o[:_f], layer.scaling,
                                (self._t2s_mido, self._t2s_lse), splits=_splits,
+                               bn=int(__import__("os").environ.get("SGLANG_TILE2_BN", "32")),
                                rot_fused=getattr(_buf, "rot_fused", False),
                                qrot=self._t2s_qrot)
             else:

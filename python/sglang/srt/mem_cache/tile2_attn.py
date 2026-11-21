@@ -305,6 +305,25 @@ def _tile2_split_decode_kernel(
             packed = _sr0 >= 0
         else:
             packed = ti < nc
+        # Tile-uniform parameter planes, loaded ONCE per tile (a chunk never straddles tiles).
+        # With BN=32 and T=128 the old placement read them 4x per tile; the profile said L1/TEX.
+        if packed:
+            _rid_h = tl.load(RIDX + req, mask=n > 0, other=0).to(tl.int64)
+            _pos_h = ti * T
+            _s0_h = tl.load(POS + _rid_h * RSTR + _pos_h, mask=_pos_h < n, other=-1).to(tl.int64)
+            _sr0_h = tl.load(SROW + _s0_h, mask=_s0_h >= 0, other=-1)
+            _ok_h = _sr0_h >= 0
+            _pc_h = ((_sr0_h // T) * H + h) * D + d
+            sA_t = (tl.load(KS + _pc_h, mask=_ok_h, other=0.0).to(tl.float32)
+                    * tl.load(KA + _pc_h, mask=_ok_h, other=0.0).to(tl.float32))
+            lA_t = (tl.load(KL + _pc_h, mask=_ok_h, other=0.0).to(tl.float32)
+                    * tl.load(KA + _pc_h, mask=_ok_h, other=0.0).to(tl.float32))
+            vA_t = tl.load(VA + _pc_h, mask=_ok_h, other=0.0).to(tl.float32)
+        else:
+            sA_t = tl.zeros((D,), tl.float32)
+            lA_t = tl.zeros((D,), tl.float32)
+            vA_t = tl.full((D,), 1.0, tl.float32)
+
         for c0 in range(0, T, BN):
             c = c0 + tl.arange(0, BN)
             posn = ti * T + c
@@ -331,14 +350,9 @@ def _tile2_split_decode_kernel(
                 # four D-wide parameter planes per token, which is what made the kernel L1/TEX bound.
                 # A chunk never straddles tiles, so the per-channel planes are tile-uniform: take
                 # the tile id from the rows themselves (max of slot_row // T) rather than from a base.
-                tid_u = tl.max(tidr)
-                any_ok = tl.max(okp.to(tl.int32)) > 0
-                pc0 = (tid_u * H + h) * D + d
-                sA = (tl.load(KS + pc0, mask=any_ok, other=0.0).to(tl.float32)
-                      * tl.load(KA + pc0, mask=any_ok, other=0.0).to(tl.float32))
-                lA = (tl.load(KL + pc0, mask=any_ok, other=0.0).to(tl.float32)
-                      * tl.load(KA + pc0, mask=any_ok, other=0.0).to(tl.float32))
-                vA_d = tl.load(VA + pc0, mask=any_ok, other=0.0).to(tl.float32)
+                sA = sA_t
+                lA = lA_t
+                vA_d = vA_t
                 ptr = (tidr * T + offr) * H + h
                 k_b = tl.load(KB + ptr, mask=okp, other=0.0).to(tl.float32)
                 a_v = (tl.load(VS + ptr, mask=okp, other=0.0).to(tl.float32)
