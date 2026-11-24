@@ -117,6 +117,9 @@ def hadamard(d: int, device, dtype=torch.float32) -> torch.Tensor:
 #: prefill is a 268 MB temporary for q at 16K; this flag tells us whether that is what makes
 #: prefill 1.8x slower than BF16.
 _NOROT = os.environ.get("SGLANG_TILE2_NOROT") == "1"
+#: SGLANG_TILE2_ONEPASS=1 (default) writes the slot/position maps once per chunk rather than once
+#: per tile; 0 restores the per-tile writes for an A/B.
+_ONEPASS = os.environ.get("SGLANG_TILE2_ONEPASS", "1") != "0"
 
 
 def rotate_hadamard_mm(x: torch.Tensor) -> torch.Tensor:
@@ -983,20 +986,34 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             # a chunked-prefill boundary then fell back to req_to_token, where the first half of
             # the tile lives in the PREVIOUS chunk's row and reads as uninitialised slots.
             pending.pop(key, None)
+        # One map write for the whole chunk instead of one per tile. `slot_row` is a pure function
+        # of (staging slot, position) and `pos_slot` of (compact request index, position); neither
+        # depends on where the tile boundaries fall, so writing them per tile only multiplied the
+        # Python loop count by `n / T`. Measured motivation: prefill leaves the GPU idle ~42 ms per
+        # layer-chunk, and 8 requests x 64 tiles x 36 layers = 18,432 iterations carry 4 device ops
+        # each. Set SGLANG_TILE2_ONEPASS=0 to restore the per-tile writes for an A/B.
+        if update_map and _ONEPASS and n > 0:
+            _pos_all = torch.arange(p, p + n, dtype=torch.long, device=buf.device)
+            if buf.pos_slot is not None and not track_positions:
+                buf.pos_slot[(ridx[i], _pos_all)] = loc[j:j + n].to(torch.int32)
+            buf.slot_row.index_copy_(
+                0, loc[j:j + n].to(torch.long),
+                -(2 + stg * buf.T + (_pos_all % buf.T).to(torch.int32)))
         while j < end:
             take = min(end - j, buf.T - fill)
             base = stg * buf.T + fill
             if not staged_vec:
                 buf.staging_k[li, base:base + take] = kr[j:j + take]
                 buf.staging_v[li, base:base + take] = vr[j:j + take]
-            if update_map:
+            if update_map and not (_ONEPASS and n > 0):
                 # Reuse one ramp buffer. `torch.arange` per request per layer is 8 x 36 small
                 # allocations a step, and the write path measured 21-47 ms/step for what is
                 # otherwise two index_copies.
                 off = _ramp(buf, buf.T)[fill:fill + take]
                 buf.slot_row.index_copy_(0, loc[j:j + take].to(torch.long),
                                          -(2 + stg * buf.T + off))
-            if buf.pos_slot is not None and not track_positions and update_map:
+            if (buf.pos_slot is not None and not track_positions and update_map
+                    and not (_ONEPASS and n > 0)):
                 # Device-side position table. The dict version below needs `loc[...].tolist()`,
                 # which is a device->host sync, and write_and_flush runs once per layer -- 36 syncs
                 # a step, each one draining the pipeline. That alone made packed_tile2 4.2x slower
