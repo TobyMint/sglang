@@ -477,11 +477,10 @@ class MHATokenToKVPool(KVCache):
         assert not self.is_mxfp4 or head_dim == 128, (
             "MXFP4 KV cache only supports head_dim=128 (Qwen3)"
         )
-        # Reproduction shim: quantize-dequantize the KV on write (bf16 storage kept).
-        from sglang.srt.mem_cache.kv_qdq import build as _build_qdq
-        self._qdq = _build_qdq(kv_cache_recipe)
+        # KV 写入路径的 QDQ 复现 shim 已于 2026-11-24 移除（只保留 packed_tile2）。
+        # 保留这两个属性是因为读路径用 getattr(self, "_qdq", None) 保护，显式置 None 语义更清楚。
+        self._qdq = None
         self._qdq_pending = {}
-        print(f"[QDQ] built recipe={kv_cache_recipe!r} handler={type(self._qdq).__name__ if self._qdq else None}", flush=True)
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(
