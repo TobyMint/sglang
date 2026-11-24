@@ -35,6 +35,10 @@ chunked-prefill row change.
 
 from __future__ import annotations
 
+#: SGLANG_TILE2_RECENT=R reads the most recent R positions from the bf16 landing window instead
+#: of the packed codes (R <= 128 = one ring). Default 0 reproduces the tile-aligned behaviour.
+_RECENT = int(__import__("os").environ.get("SGLANG_TILE2_RECENT", "0"))
+
 import torch
 
 try:
@@ -255,6 +259,7 @@ def _tile2_split_decode_kernel(
     RSTR: tl.constexpr, H: tl.constexpr, D: tl.constexpr, T: tl.constexpr,
     G: tl.constexpr, HQ: tl.constexpr, BQ_: tl.constexpr, BN: tl.constexpr,
     SPLITS: tl.constexpr, ROT: tl.constexpr = False, USE_SROW: tl.constexpr = True,
+    RECENT: tl.constexpr = 0,
 ):
     """Stage 1 of split-K flash decoding.
 
@@ -362,6 +367,14 @@ def _tile2_split_decode_kernel(
                 khat = (ck * sA[None, :] + lA[None, :]).to(tl.bfloat16)             # [BN, D]
 
                 fb = valid & ~okp
+                if RECENT > 0:
+                    # The landing window is a 128-deep ring over positions mod T, so the most
+                    # recent RECENT positions are still bit-exact there even after their tile
+                    # closed. Reading them from the ring instead of the 2-bit codes is exactly
+                    # the "recent R tokens in high precision" that KIVI/KVarN implement with an
+                    # explicit FP16 window -- here it costs no extra memory, because the ring is
+                    # allocated anyway. RECENT <= T only (one ring's worth).
+                    fb = fb | (valid & (posn >= n - RECENT))
                 sa = ((stg * T + c[:, None]) * H + h) * D + d[None, :]
                 kf = tl.load(STGK + sa, mask=fb[:, None], other=0.0)
                 vf = tl.load(STGV + sa, mask=fb[:, None], other=0.0)
@@ -495,6 +508,7 @@ def fused_decode_split(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         G=hq // buf.H, HQ=hq, BQ_=max(16, hq // buf.H), BN=bn, SPLITS=splits,
         ROT=rot_fused,
         USE_SROW=getattr(buf, "radix_on", True),
+        RECENT=_RECENT,
         num_warps=int(__import__("os").environ.get("SGLANG_TILE2_WARPS", "4")),
         num_stages=int(__import__("os").environ.get("SGLANG_TILE2_STAGES", "2")),
     )
