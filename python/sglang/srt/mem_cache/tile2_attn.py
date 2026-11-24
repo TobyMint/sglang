@@ -38,6 +38,9 @@ from __future__ import annotations
 #: SGLANG_TILE2_RECENT=R reads the most recent R positions from the bf16 landing window instead
 #: of the packed codes (R <= 128 = one ring). Default 0 reproduces the tile-aligned behaviour.
 _RECENT = int(__import__("os").environ.get("SGLANG_TILE2_RECENT", "0"))
+if _RECENT:
+    print(f"[TILE2] decode read path: the last {_RECENT} positions come from the bf16 landing "
+          f"window; the rest from the packed codes", flush=True)
 
 import torch
 
