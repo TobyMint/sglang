@@ -111,6 +111,14 @@ def hadamard(d: int, device, dtype=torch.float32) -> torch.Tensor:
     return h
 
 
+#: SGLANG_TILE2_NOROT=1 skips the Hadamard rotation entirely. Numerically WRONG on purpose --
+#: it exists to measure what the rotation costs, the same way SGLANG_TILE2_ITERS=0 does for VarN.
+#: `rotate_hadamard_mm` materialises an fp32 copy of its input (`x.float()` below), which during
+#: prefill is a 268 MB temporary for q at 16K; this flag tells us whether that is what makes
+#: prefill 1.8x slower than BF16.
+_NOROT = os.environ.get("SGLANG_TILE2_NOROT") == "1"
+
+
 def rotate_hadamard_mm(x: torch.Tensor) -> torch.Tensor:
     """x @ H with the Hadamard in x's own dtype, so no casts are needed.
 
@@ -125,6 +133,8 @@ def rotate_hadamard_mm(x: torch.Tensor) -> torch.Tensor:
     the batch shape, and a two-ULP change on an outlier moves the per-channel min/max and hence the
     codes, which is what made chunked and single-call writes disagree.
     """
+    if _NOROT:
+        return x
     d = x.shape[-1]
     # fp32 measured faster than a bf16 Hadamard here (118.0 vs 106.5 tok/s), so the casts stay.
     h = hadamard(d, x.device, torch.float32)
@@ -143,6 +153,8 @@ def rotate_hadamard(x: torch.Tensor) -> torch.Tensor:
     chunking test. The FWHT is additions only, per row, in a fixed order, so the staged bf16
     values are identical no matter how the writes are chunked.
     """
+    if _NOROT:
+        return x.float()
     n = x.shape[-1]
     lead = x.shape[:-1]
     y = x.float()
