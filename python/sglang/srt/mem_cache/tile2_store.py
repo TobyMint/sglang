@@ -586,6 +586,25 @@ class Tile2Buffers:
 _RAMP: dict = {}
 
 
+def _step_cache(buf, name: str, key, build):
+    """Build a small device tensor at most once per distinct `key`.
+
+    The KV-write bookkeeping runs once per layer, but `stg_of` / `pre_lens` / the request rows are
+    identical across all 36 layers of a step. Rebuilding those tensors per layer cost 576
+    host->device copies a step (measured: 75,864 cudaMemcpyAsync against BF16's 475 over the same
+    trace), which is pure launch overhead -- the values are the same every time.
+    """
+    cache = getattr(buf, "_step_tensor_cache", None)
+    if cache is None:
+        cache = buf._step_tensor_cache = {}
+    hit = cache.get(name)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    val = build()
+    cache[name] = (key, val)
+    return val
+
+
 def _ramp(buf, n: int) -> torch.Tensor:
     """A cached 0..n-1 int32 device ramp."""
     key = (buf.device, n)
@@ -907,19 +926,26 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                                                         for x in pre_lens)):
             if update_map:
                 _loc = loc.to(torch.long)
-                buf.slot_row.index_copy_(
-                    0, _loc,
-                    -(2 + (torch.tensor([int(x) for x in stg_of], dtype=torch.int32,
-                                        device=buf.device) * buf.T
-                          + (torch.tensor([int(x) % buf.T for x in pre_lens],
-                                          dtype=torch.int32, device=buf.device)))))
+                _sr_val = _step_cache(buf, "srow_val", (tuple(stg_of), tuple(pre_lens)),
+                                      lambda: -(2 + (
+                                          torch.tensor([int(x) for x in stg_of], dtype=torch.int32,
+                                                       device=buf.device) * buf.T
+                                          + torch.tensor([int(x) % buf.T for x in pre_lens],
+                                                         dtype=torch.int32, device=buf.device))))
+                buf.slot_row.index_copy_(0, _loc, _sr_val)
                 if buf.pos_slot is not None:
                     # The position table is indexed by the request's COMPACT index, not by the
                     # req_to_token row -- the row changes between prefill chunks.
-                    _ri = (torch.tensor([int(ridx_of(int(k))) for k in keys], dtype=torch.long,
-                                        device=buf.device) if ridx_of is not None
-                           else torch.tensor([int(x) for x in rows], dtype=torch.long,
-                                             device=buf.device))
+                    if ridx_of is not None:
+                        _ri = _step_cache(buf, "posrow", tuple(keys),
+                                          lambda: torch.tensor(
+                                              [int(ridx_of(int(k))) for k in keys],
+                                              dtype=torch.long, device=buf.device))
+                    else:
+                        _ri = _step_cache(buf, "posrow", tuple(rows),
+                                          lambda: torch.tensor(
+                                              [int(x) for x in rows],
+                                              dtype=torch.long, device=buf.device))
                     _pt = torch.tensor([int(x) for x in pre_lens], dtype=torch.long, device=buf.device)
                     buf.pos_slot[(_ri, _pt)] = _loc.to(torch.int32)
             return
