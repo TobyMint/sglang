@@ -992,7 +992,11 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
         # Python loop count by `n / T`. Measured motivation: prefill leaves the GPU idle ~42 ms per
         # layer-chunk, and 8 requests x 64 tiles x 36 layers = 18,432 iterations carry 4 device ops
         # each. Set SGLANG_TILE2_ONEPASS=0 to restore the per-tile writes for an A/B.
-        if update_map and _ONEPASS and n > 0:
+        # `slot_row` and `pos_slot` are shared by all layers -- the tile grid is anchored at
+        # position 0, so layer L and layer 0 must write the same values. Writing them on every
+        # layer is therefore 36x redundant. Layer 0 runs first in every forward, so the maps are
+        # already correct by the time layers 1..35 read them.
+        if update_map and _ONEPASS and n > 0 and li == buf.start_layer:
             _pos_all = torch.arange(p, p + n, dtype=torch.long, device=buf.device)
             if buf.pos_slot is not None and not track_positions:
                 buf.pos_slot[(ridx[i], _pos_all)] = loc[j:j + n].to(torch.int32)
