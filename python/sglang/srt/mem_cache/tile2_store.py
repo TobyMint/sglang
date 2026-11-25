@@ -121,6 +121,12 @@ _NOROT = os.environ.get("SGLANG_TILE2_NOROT") == "1"
 #: per tile; 0 restores the per-tile writes for an A/B.
 _ONEPASS = os.environ.get("SGLANG_TILE2_ONEPASS", "1") != "0"
 
+#: SGLANG_TILE2_NOSTAGE=1 skips the bf16 landing-window writes. DIAGNOSTIC ONLY -- the flush then
+#: reads stale rows and every result is wrong. It prices the write half of the staging round trip:
+#: every token is written to the ring as bf16 and read back for quantisation, which for prefill is
+#: 4 KiB written + 4 KiB read per token per layer (8.6 KiB/token/layer including the packed codes).
+_NOSTAGE = os.environ.get("SGLANG_TILE2_NOSTAGE") == "1"
+
 
 def rotate_hadamard_mm(x: torch.Tensor) -> torch.Tensor:
     """x @ H with the Hadamard in x's own dtype, so no casts are needed.
@@ -929,8 +935,9 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             src = stg_t * buf.T + (pre_t % buf.T)
         if _PROF is not None:
             _ts0 = time.perf_counter()
-        buf.staging_k[li].index_copy_(0, src, kr)
-        buf.staging_v[li].index_copy_(0, src, vr)
+        if not _NOSTAGE:
+            buf.staging_k[li].index_copy_(0, src, kr)
+            buf.staging_v[li].index_copy_(0, src, vr)
         if _PROF is not None:
             _prof_add("stgact", time.perf_counter() - _ts0)
         staged_vec = True
@@ -1007,8 +1014,9 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             take = min(end - j, buf.T - fill)
             base = stg * buf.T + fill
             if not staged_vec:
-                buf.staging_k[li, base:base + take] = kr[j:j + take]
-                buf.staging_v[li, base:base + take] = vr[j:j + take]
+                if not _NOSTAGE:
+                    buf.staging_k[li, base:base + take] = kr[j:j + take]
+                    buf.staging_v[li, base:base + take] = vr[j:j + take]
             if update_map and not (_ONEPASS and n > 0):
                 # Reuse one ramp buffer. `torch.arange` per request per layer is 8 x 36 small
                 # allocations a step, and the write path measured 21-47 ms/step for what is
