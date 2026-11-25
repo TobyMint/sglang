@@ -367,6 +367,12 @@ def _tile2_split_decode_kernel(
                 sA = sA_t
                 lA = lA_t
                 vA_d = vA_t
+                if RECENT > 0:
+                    # A row redirected to the ring carries its EXACT bf16 value, but the chunk
+                    # output is multiplied by this tile's per-channel V scale `vA_d` further down.
+                    # Pre-dividing the staged value cancels that multiply. Without this a recent
+                    # row contributes V*vA instead of V (Codex audit, tile2_attn.py:432).
+                    inv_vA = tl.where(vA_d != 0.0, 1.0 / vA_d, 0.0)
                 ptr = (tidr * T + offr) * H + h
                 k_b = tl.load(KB + ptr, mask=okp, other=0.0).to(tl.float32)
                 a_v = (tl.load(VS + ptr, mask=okp, other=0.0).to(tl.float32)
@@ -393,6 +399,8 @@ def _tile2_split_decode_kernel(
                 sa = ((stg * T + c[:, None]) * H + h) * D + d[None, :]
                 kf = tl.load(STGK + sa, mask=fb[:, None], other=0.0)
                 vf = tl.load(STGV + sa, mask=fb[:, None], other=0.0)
+                if RECENT > 0:
+                    vf = (vf.to(tl.float32) * inv_vA[None, :]).to(vf.dtype)
                 # Staged rows are already exact: fold them in as k_b = v_b = 1, a_v = 1, b_v = 0.
                 use_st = fb | ~okp
                 k_b = tl.where(use_st, 1.0, k_b)
