@@ -939,6 +939,7 @@ def _flush_commit_batch(buf: Tile2Buffers, li: int, q: list, allp: dict, masks) 
     full_all = masks is None
     slots_all = torch.cat([c["slots"] for c in q])
     if slots_all.dtype != torch.long:
+        # one conversion for the whole layer instead of one per tile (the ctx carries int32)
         slots_all = slots_all.to(torch.long)
     tiles = torch.tensor([c["tile"] for c in q], dtype=torch.long, device=buf.device)
     codes_k = allp["codes_k"].reshape(N * T, *allp["codes_k"].shape[2:])
@@ -1045,6 +1046,10 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                       f"nloc={loc.numel()}", flush=True)
     ridx_list = ([ridx_of(int(k)) for k in keys] if ridx_of is not None
                  else [int(rows[i]) for i in range(len(rows))])
+    #: Layer views, hoisted out of the per-tile loop: `staging_k[li]` is a select + as_strided on
+    #: every use, and it is used twice per tile.
+    stg_k_li = buf.staging_k[li]
+    stg_v_li = buf.staging_v[li]
     # ---- decode fast path: stage every request's single row in one shot -------------------
     # The per-request loop below is 8 iterations x 36 layers = 288 Python/torch calls a step, and it
     # measured 26 ms/step for what is two index_copies. When every request writes exactly one row
@@ -1061,8 +1066,8 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
         if _PROF is not None:
             _ts0 = time.perf_counter()
         if not _NOSTAGE:
-            buf.staging_k[li].index_copy_(0, src, kr)
-            buf.staging_v[li].index_copy_(0, src, vr)
+            stg_k_li.index_copy_(0, src, kr)
+            stg_v_li.index_copy_(0, src, vr)
         if _PROF is not None:
             _prof_add("stgact", time.perf_counter() - _ts0)
         staged_vec = True
@@ -1106,6 +1111,7 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
         key = int(keys[i])
         stg = int(stg_of[i])
         ridx = ridx_list
+        pos_row = buf.pos_slot[ridx[i]] if buf.pos_slot is not None else None
         j, end = start, start + n
         p = pre
         fill = pre % buf.T
@@ -1147,7 +1153,7 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             # layer (the one-pass write), but pos_slot persists unchanged for layers 1..35, so the
             # validation is valid on every layer. Gating it on update_map left the per-tile
             # `.min()` running on 35 of 36 layers.
-            _pos_ok = int(buf.pos_slot[ridx[i], p:p + n].min()) >= 0
+            _pos_ok = int(pos_row[p:p + n].min()) >= 0
         while j < end:
             take = min(end - j, buf.T - fill)
             if fill == 0:
@@ -1155,8 +1161,8 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             base = stg * buf.T + fill
             if not staged_vec:
                 if not _NOSTAGE:
-                    buf.staging_k[li, base:base + take] = kr[j:j + take]
-                    buf.staging_v[li, base:base + take] = vr[j:j + take]
+                    stg_k_li[base:base + take] = kr[j:j + take]
+                    stg_v_li[base:base + take] = vr[j:j + take]
             if update_map and not (_ONEPASS and n > 0):
                 # Reuse one ramp buffer. `torch.arange` per request per layer is 8 x 36 small
                 # allocations a step, and the write path measured 21-47 ms/step for what is
@@ -1174,11 +1180,12 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                 # request's COMPACT index, which survives a chunked-prefill row change.
                 pos_t = torch.arange(p, p + take, dtype=torch.long, device=buf.device)
                 buf.pos_slot[(ridx[i], pos_t)] = loc[j:j + take].to(torch.int32)
-            elif pending is not None:
-                # position -> slot, idempotent by construction: write_and_flush runs once per layer
-                # (36 times a step) and a tile can straddle a chunked-prefill boundary, so anything
-                # that counts appends has to be exactly right 36 times over. A map only has to be
-                # right once.
+            elif pending is not None and not _pos_ok:
+                # Host-side position -> slot dict, used only as a fallback when the device
+                # `pos_slot` table cannot be trusted (see `_pos_ok` above). When `_pos_ok` is true
+                # the tile close reads pos_slot and never looks at this dict, so maintaining it
+                # was a 1024-byte DtoH copy + a full stream synchronisation PER TILE (measured:
+                # 576 of the 662 remaining syncs in a chunk).
                 m = pending.setdefault(key, {})
                 for off_i, sl_ in zip(range(p, p + take), loc[j:j + take].tolist()):
                     m[off_i] = sl_
@@ -1205,7 +1212,8 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                     # "IndexError: index 513 is out of bounds for dimension 0 with size 513".
                     _ri_tile = ridx[i] if ridx is not None else (
                         ridx_of(int(key)) if ridx_of is not None else int(row))
-                    cand = buf.pos_slot[_ri_tile, p - buf.T:p]
+                    cand = pos_row[p - buf.T:p] if _ri_tile == ridx[i] else \
+                        buf.pos_slot[_ri_tile, p - buf.T:p]
                     if int(cand.numel()) == buf.T and (_pos_ok or int(cand.min()) >= 0):
                         slots = cand.to(torch.long)
                         nacc = buf.T
