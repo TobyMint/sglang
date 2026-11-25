@@ -366,7 +366,13 @@ def _tile2_split_decode_kernel(
             lA_t = tl.zeros((D,), tl.float32)
             vA_t = tl.full((D,), 1.0, tl.float32)
 
-        for c0 in range(0, T, BN):
+        # UNROLLED (T/BN = 4 chunks at T=128, BN=32). The compiler emits the four chunk bodies
+        # together, so the four independent `slots`->`codes` gathers can be issued before the
+        # first one is consumed. With a runtime `range` each iteration waited for its own
+        # `slots` load before the code load could even be addressed, so no memory-level
+        # parallelism existed across chunks and `num_stages` had nothing to work with
+        # (the kernel is SHARED:0: there is no pipeline buffer to stage into).
+        for c0 in tl.static_range(0, T, BN):
             c = c0 + tl.arange(0, BN)
             posn = ti * T + c
             valid = posn < n
