@@ -127,6 +127,14 @@ _ONEPASS = os.environ.get("SGLANG_TILE2_ONEPASS", "1") != "0"
 #: 4 KiB written + 4 KiB read per token per layer (8.6 KiB/token/layer including the packed codes).
 _NOSTAGE = os.environ.get("SGLANG_TILE2_NOSTAGE") == "1"
 
+#: SGLANG_TILE2_FUSE=1 (default on) feeds the quantiser straight from the chunk being written
+#: whenever a whole tile lies inside it, instead of routing those rows through the bf16 landing
+#: window and copying them back out of it. The copy is the expensive part: queue_flush has to
+#: clone each closing tile's 512 KiB out of the window because the window is reused before the
+#: layer ends, and a chunk-fed slice stays alive until drain_flushes returns. Set to 0 to restore
+#: the window path for an A/B.
+_FUSE = os.environ.get("SGLANG_TILE2_FUSE", "1") != "0"
+
 
 def rotate_hadamard_mm(x: torch.Tensor) -> torch.Tensor:
     """x @ H with the Hadamard in x's own dtype, so no casts are needed.
@@ -660,7 +668,7 @@ def own_rows_mask(buf: Tile2Buffers, key: int, ti: int, slots: torch.Tensor) -> 
 
 def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                    slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
-                   req_row: int = -1, key: int = -1, own_mask=None):
+                   req_row: int = -1, key: int = -1, own_mask=None, direct=None):
     """Gather one closing tile out of the landing window and build its row mask.
 
     Split out of `flush_tile` so that all the tiles closing in one layer can be quantised in ONE
@@ -671,8 +679,15 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
 
     base = stg * buf.T
     slots = slots.to(torch.long)
-    k = buf.staging_k[li, base:base + n_valid]
-    v = buf.staging_v[li, base:base + n_valid]
+    if direct is not None:
+        # The whole tile came out of the chunk that is being written right now, so take it straight
+        # from there instead of bouncing through the landing window. `direct` stays alive until
+        # `drain_flushes` returns (the caller still holds it), which also makes the defensive
+        # `.clone()` in queue_flush unnecessary for this path.
+        k, v = direct
+    else:
+        k = buf.staging_k[li, base:base + n_valid]
+        v = buf.staging_v[li, base:base + n_valid]
     mask = torch.zeros(buf.T, dtype=torch.bool, device=buf.device)
     mask[:n_valid] = True
     if own_mask is not None:
@@ -703,7 +718,7 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
             if nbad:
                 print(f"[TILE2-ARGH] staging mismatch at flush: {nbad}/{len(hit)} rows "
                       f"worse than 5% (worst {float(bad.max()):.3f}) layer={li}", flush=True)
-    return dict(k=kq_, v=vq_, mask=mask, slots=slots, tile=int(tile),
+    return dict(k=kq_, v=vq_, mask=mask, slots=slots, tile=int(tile), direct=direct is not None,
                 update_map=update_map, count_tokens=count_tokens, key=key,
                 n_valid=int(n_valid))
 
@@ -818,10 +833,10 @@ def _flush_q(buf: Tile2Buffers) -> dict:
 
 def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                 slots: torch.Tensor, update_map: bool, count_tokens: bool = False,
-                req_row: int = -1, key: int = -1, own_mask=None) -> None:
+                req_row: int = -1, key: int = -1, own_mask=None, direct=None) -> None:
     """Stage a closing tile; `drain_flushes` quantises the whole layer's batch in one go."""
     ctx = _flush_prepare(buf, li, stg, n_valid, tile, slots, update_map, count_tokens,
-                         req_row, key, own_mask)
+                         req_row, key, own_mask, direct=direct)
     if ctx is not None and os.environ.get("SGLANG_TILE2_FLUSH_NOW") == "1":
         # Diagnostic: quantise immediately (pre-batching behaviour) so an A/B can tell whether
         # deferring the quantisation to the end of the layer changed anything numerically.
@@ -833,8 +848,9 @@ def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
         # tile closes the window restarts at fill = 0 for the request's next tile -- so by the time
         # the layer ends and the batch is quantised, that memory holds a different tile's rows.
         # Batching without this copy quantised the wrong data (P2 caught it: V relRMS 0.997).
-        ctx["k"] = ctx["k"].clone()
-        ctx["v"] = ctx["v"].clone()
+        if not ctx.get("direct"):
+            ctx["k"] = ctx["k"].clone()
+            ctx["v"] = ctx["v"].clone()
         ctx["slots"] = ctx["slots"].clone()
         _flush_q(buf).setdefault(li, []).append(ctx)
 
@@ -984,6 +1000,7 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
         j, end = start, start + n
         p = pre
         fill = pre % buf.T
+        _tile_j0 = -1                      # where the tile currently filling began, in this chunk
         if pending is not None and pre == 0 and li == buf.start_layer:
             # pre == 0 means a request is starting. The identity we key on (the position-0 slot) is
             # recycled once the old request is gone, so anything left under it is stale.
@@ -1012,6 +1029,8 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                 -(2 + stg * buf.T + (_pos_all % buf.T).to(torch.int32)))
         while j < end:
             take = min(end - j, buf.T - fill)
+            if fill == 0:
+                _tile_j0 = j
             base = stg * buf.T + fill
             if not staged_vec:
                 if not _NOSTAGE:
@@ -1123,9 +1142,14 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                 if _own is not None and not bool(_own.any()):
                     fill = 0          # fully inherited tile: nothing of ours to pack
                     continue
+                # A tile that began at fill == 0 inside this chunk is entirely in `kr`, so hand
+                # the quantiser the chunk slice directly (no landing-window round trip, no clone).
+                _direct = None
+                if _FUSE and _tile_j0 >= 0 and _tile_j0 + buf.T <= end:
+                    _direct = (kr[_tile_j0:_tile_j0 + buf.T], vr[_tile_j0:_tile_j0 + buf.T])
                 queue_flush(buf, li, stg, buf.T, tile_for_slots(buf, tile_of, key, _ti, slots), slots, update_map,
                             count_tokens=(li == buf.start_layer), req_row=row, key=key,
-                            own_mask=_own)
+                            own_mask=_own, direct=_direct)
                 fill = 0
         start = end
     drain_flushes(buf, li)
