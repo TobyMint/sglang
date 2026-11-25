@@ -361,11 +361,16 @@ def _tile2_split_decode_kernel(
             lA_t = (tl.load(KL + _pc_h, mask=_ok_h, other=0.0).to(tl.float32)
                     * tl.load(KA + _pc_h, mask=_ok_h, other=0.0).to(tl.float32))
             vA_t = tl.load(VA + _pc_h, mask=_ok_h, other=0.0).to(tl.float32)
+        else:
+            sA_t = tl.zeros((D,), tl.float32)
+            lA_t = tl.zeros((D,), tl.float32)
+            vA_t = tl.full((D,), 1.0, tl.float32)
 
-            for c0 in range(0, T, BN):
-                c = c0 + tl.arange(0, BN)
-                posn = ti * T + c
-                valid = posn < n
+        for c0 in range(0, T, BN):
+            c = c0 + tl.arange(0, BN)
+            posn = ti * T + c
+            valid = posn < n
+            if packed:
                 slots = tl.load(POS + ridx * RSTR + posn, mask=valid, other=-1).to(tl.int64)
                 ok = valid & (slots >= 0)
                 kaddr = (slots[:, None] * H + h) * (D // 4) + db[None, :]
@@ -436,28 +441,9 @@ def _tile2_split_decode_kernel(
                 w = tl.load(VC + kaddr, mask=ok[:, None], other=0)
                 cv = tl.reshape((w[:, :, None] >> sh4[None, None, :]) & 3, (BN, D)).to(tl.bfloat16)
                 vcode = tl.where(fb[:, None], vf, cv)
-                # score = q . khat, then the per-token K factor scales the finished row
-                sc = tl.dot(q, tl.trans(khat)) * SCALE * k_b[None, :]
-                sc = tl.where(valid[None, :], sc, -float("inf"))
-                mn = tl.maximum(m, tl.max(sc, 1))
-                dead = mn == -float("inf")
-                safe = tl.where(dead, 0.0, mn)
-                p = tl.exp(sc - safe[:, None])
-                alpha = tl.where(dead, 0.0, tl.exp(m - safe))
-                z = z * alpha + tl.sum(p, 1)
-                # acc = sum_j p_j * (code_j * a_j + b_j) * vA  -- two cheap accumulations, no vA plane
-                # in the inner loop: the code term is a dot, the offset term is a scalar sum.
-                pa = (p * a_v[None, :]).to(tl.bfloat16)
-                # vA multiplies the WHOLE bracket, not just the offset term.
-                acc = (acc * alpha[:, None]
-                       + (tl.dot(pa, vcode) + tl.sum(p * b_v[None, :], 1)[:, None])
-                       * vA_d[None, :])
-                m = mn
-        else:
-            for c0 in range(0, T, BN):
-                c = c0 + tl.arange(0, BN)
-                posn = ti * T + c
-                valid = posn < n
+                sA_eff = sA
+                m_extra = None
+            else:
                 a_st = ((stg * T + c[:, None]) * H + h) * D + d[None, :]
                 khat = tl.load(STGK + a_st, mask=valid[:, None], other=0.0)
                 vcode = tl.load(STGV + a_st, mask=valid[:, None], other=0.0)
@@ -467,23 +453,23 @@ def _tile2_split_decode_kernel(
                 b_v = tl.zeros((BN,), tl.float32)
                 vA_d = tl.full((D,), 1.0, tl.float32)
 
-                # score = q . khat, then the per-token K factor scales the finished row
-                sc = tl.dot(q, tl.trans(khat)) * SCALE * k_b[None, :]
-                sc = tl.where(valid[None, :], sc, -float("inf"))
-                mn = tl.maximum(m, tl.max(sc, 1))
-                dead = mn == -float("inf")
-                safe = tl.where(dead, 0.0, mn)
-                p = tl.exp(sc - safe[:, None])
-                alpha = tl.where(dead, 0.0, tl.exp(m - safe))
-                z = z * alpha + tl.sum(p, 1)
-                # acc = sum_j p_j * (code_j * a_j + b_j) * vA  -- two cheap accumulations, no vA plane
-                # in the inner loop: the code term is a dot, the offset term is a scalar sum.
-                pa = (p * a_v[None, :]).to(tl.bfloat16)
-                # vA multiplies the WHOLE bracket, not just the offset term.
-                acc = (acc * alpha[:, None]
-                       + (tl.dot(pa, vcode) + tl.sum(p * b_v[None, :], 1)[:, None])
-                       * vA_d[None, :])
-                m = mn
+            # score = q . khat, then the per-token K factor scales the finished row
+            sc = tl.dot(q, tl.trans(khat)) * SCALE * k_b[None, :]
+            sc = tl.where(valid[None, :], sc, -float("inf"))
+            mn = tl.maximum(m, tl.max(sc, 1))
+            dead = mn == -float("inf")
+            safe = tl.where(dead, 0.0, mn)
+            p = tl.exp(sc - safe[:, None])
+            alpha = tl.where(dead, 0.0, tl.exp(m - safe))
+            z = z * alpha + tl.sum(p, 1)
+            # acc = sum_j p_j * (code_j * a_j + b_j) * vA  -- two cheap accumulations, no vA plane
+            # in the inner loop: the code term is a dot, the offset term is a scalar sum.
+            pa = (p * a_v[None, :]).to(tl.bfloat16)
+            # vA multiplies the WHOLE bracket, not just the offset term.
+            acc = (acc * alpha[:, None]
+                   + (tl.dot(pa, vcode) + tl.sum(p * b_v[None, :], 1)[:, None])
+                   * vA_d[None, :])
+            m = mn
 
     nonempty = z > 0
     o = acc / tl.where(nonempty, z, 1.0)[:, None]
