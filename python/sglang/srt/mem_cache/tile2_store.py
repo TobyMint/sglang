@@ -1787,10 +1787,19 @@ class Tile2Driver:
             # capture are irrelevant; only the absence of host reads matters.
             b.stg_tab = torch.zeros((r2t.shape[0],), dtype=torch.int64, device=b.device)
             b.base_tab = torch.zeros((r2t.shape[0],), dtype=torch.int64, device=b.device)
-        rows = fb.req_pool_indices.to(torch.long)
-        pre = fb.seq_lens.to(torch.long) - 1
         T = b.T
-        fill = pre % T
+        # ---- step-invariant derivations: once per decode step, not once per layer ------------
+        # `rows`/`pre`/`fill`/`valid`/`stg`/`src` depend on the batch (and on the token->slot map,
+        # which is layer-independent), not on the layer. The start layer computes them inside the
+        # captured graph, so at replay its ops run first and rewrite the same buffers every step;
+        # layers 1..L-1 just read those tensors. Before this, all 36 layers recomputed them:
+        # ~12 extra kernels per layer (~430/step) plus 5 for the closed record (~180/step), and
+        # each launch leaves the GPU idle (decode occupancy measured 79-84% vs BF16's 98%).
+        first = (li == self.start_layer) or (getattr(self, "_dec_src", None) is None)
+        if first:
+            rows = fb.req_pool_indices.to(torch.long)
+            pre = fb.seq_lens.to(torch.long) - 1
+            fill = pre % T
         # CUDA-graph batch padding. When the true batch size is not an exactly captured one,
         # `cuda_graph_runner.replay_prepare` pads up to the next captured size, fills the padded
         # rows' `seq_lens` with the backend's fill value and zeroes their `out_cache_loc`; the
@@ -1804,17 +1813,38 @@ class Tile2Driver:
         # `out_cache_loc` entries (see install()): a spare KV slot no request can ever own. Padded
         # tokens are then REDIRECTED to dustbin rows instead of being filtered out, because
         # filtering would need `nonzero` -- a data-dependent shape, which capture rejects.
-        sent = getattr(b, "pad_sentinel", None)
-        if sent is not None:
-            valid = loc != sent
+            sent = getattr(b, "pad_sentinel", None)
+            if sent is not None:
+                valid = loc != sent
+            else:
+                valid = torch.ones_like(loc, dtype=torch.bool)
+            stg = b.stg_tab.index_select(0, rows)
+            if (not torch.cuda.is_current_stream_capturing()) and bool(((stg < 0) & valid).any()):
+                raise RuntimeError("[TILE2] decode reached a row with no staging slot; the "
+                                   "routing tables are only filled by the prefill path")
+            src = torch.where(valid, stg * T + fill, torch.full_like(stg * T + fill,
+                                                                    b.dustbin_stg_row))
+            self._dec_rows, self._dec_pre, self._dec_fill = rows, pre, fill
+            self._dec_valid, self._dec_stg, self._dec_src = valid, stg, src
+            # closed marking is identical for every layer -> one record per step. The deferred
+            # flush reads this single row for all layers.
+            if b.closed is None or b.closed.shape[1] < rows.numel():
+                b.closed = torch.full((b.L, max(4096, int(rows.numel()))), -1,
+                                      dtype=torch.int64, device=b.device)
+            if b.closed_mask is None or b.closed_mask.shape[1] < rows.numel():
+                b.closed_mask = torch.zeros((b.L, max(4096, int(rows.numel()))),
+                                            dtype=torch.bool, device=b.device)
+            c = b.closed[self.start_layer]
+            c.fill_(-1)
+            c[:rows.numel()].copy_(rows)
+            m = b.closed_mask[self.start_layer]
+            m.fill_(False)
+            # A padded row must never be reported as a closed tile: `flush_deferred` would
+            # quantise a tile for whatever request owns that stale row.
+            m[:rows.numel()].copy_((fill == (T - 1)) & valid)
         else:
-            valid = torch.ones_like(loc, dtype=torch.bool)
-        stg = b.stg_tab.index_select(0, rows)
-        if (not torch.cuda.is_current_stream_capturing()) and bool(((stg < 0) & valid).any()):
-            raise RuntimeError("[TILE2] decode reached a row with no staging slot; the routing "
-                               "tables are only filled by the prefill path")
-        src = torch.where(valid, stg * T + fill, torch.full_like(stg * T + fill,
-                                                                b.dustbin_stg_row))
+            rows, pre, fill = self._dec_rows, self._dec_pre, self._dec_fill
+            valid, stg, src = self._dec_valid, self._dec_stg, self._dec_src
         # k/v arrive ALREADY rotated: the wrapper rotates them when rot_domain is on, and the
         # host write path is told `rotate=False` for exactly that reason. Rotating again here was
         # a double rotation and made the whole decode store wrong (0/8 with CUDA graphs).
@@ -1839,24 +1869,7 @@ class Tile2Driver:
             # radix cache, where slot reuse across requests is the norm.
             b.slot_row.index_copy_(0, loc.to(torch.long),
                                    (-(2 + stg * T + fill)).to(torch.int32))
-        # mark rows whose tile just closed, for the post-forward flush
-        if b.closed is None or b.closed.shape[1] < rows.numel():
-            b.closed = torch.full((b.L, max(4096, int(rows.numel()))), -1,
-                                  dtype=torch.int64, device=b.device)
-        # Fixed-shape only: `torch.nonzero` is rejected during capture because its output size
-        # depends on the data. Write the whole batch plus a per-row flag and let the deferred
-        # flush (which runs on the host, outside the graph) do the filtering.
-        bs = int(rows.numel())
-        c = b.closed[li]
-        c.fill_(-1)
-        c[:bs].copy_(rows)
-        if b.closed_mask is None or b.closed_mask.shape[1] < bs:
-            b.closed_mask = torch.zeros((b.L, max(4096, bs)), dtype=torch.bool, device=b.device)
-        m = b.closed_mask[li]
-        m.fill_(False)
-        # A padded row must never be reported as a closed tile: `flush_deferred` would quantise a
-        # tile for whatever request owns that stale row.
-        m[:bs].copy_((fill == (T - 1)) & valid)
+
 
     def flush_deferred(self, fb) -> None:
         """Quantise every tile that a decode step closed. Runs OUTSIDE the captured graph."""
@@ -1914,9 +1927,11 @@ class Tile2Driver:
             if kk in self._lru:
                 self._lru.remove(kk)
             self._lru.append(kk)
+        # The closed/mask record is written once per step (start layer) and is layer-independent.
+        _rec = self.start_layer
         for li in range(b.L):
-            col = b.closed[li]
-            msk = b.closed_mask[li] if b.closed_mask is not None else None
+            col = b.closed[_rec]
+            msk = b.closed_mask[_rec] if b.closed_mask is not None else None
             sel = col >= 0
             if msk is not None:
                 sel = sel & msk
@@ -1949,9 +1964,12 @@ class Tile2Driver:
                             count_tokens=(li == b.start_layer), req_row=int(r),
                             key=_key, own_mask=_own)
             drain_flushes(b, li)
-            col.fill_(-1)
-            if b.closed_mask is not None:
-                b.closed_mask[li].fill_(False)
+        # The record is shared by every layer now, so clear it ONCE after the loop. Clearing it
+        # inside the loop (as the per-layer version did) would leave layers 1..L-1 with no closed
+        # rows and silently never flush their tiles.
+        b.closed[_rec].fill_(-1)
+        if b.closed_mask is not None:
+            b.closed_mask[_rec].fill_(False)
 
     # -- one layer of one step ----------------------------------------------
     def step(self, li: int, fb, k, v, loc) -> None:
