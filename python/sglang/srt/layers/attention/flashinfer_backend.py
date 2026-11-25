@@ -7,6 +7,11 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import os as _os
+
+#: SGLANG_TILE2_COST=1 prints the prefill dequant volume (no timing, no sync).
+_T2_COST = _os.environ.get("SGLANG_TILE2_COST") == "1"
+
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -992,6 +997,20 @@ class FlashInferAttnBackend(AttentionBackend):
         if getattr(pool, "is_packed_tile2", False):
             from sglang.srt.mem_cache.tile2_store import gather_dequant as _t2_gather
             idx, n = self.cur_kv_indices, self.cur_kv_len
+            if _T2_COST:
+                # Zero-overhead accounting (no synchronise, no timing): how many token rows the
+                # prefill path dequantises and re-rotates. With chunked prefill the prefix grows
+                # every chunk, so this total is quadratic in the prompt length -- this counter is
+                # what turns that statement into a number.
+                _acc = self.__dict__.setdefault("_t2cost", {"n": 0, "calls": 0, "peak": 0})
+                _acc["n"] += int(n)
+                _acc["calls"] += 1
+                _acc["peak"] = max(_acc["peak"], int(n))
+                if _acc["calls"] % 36 == 0:
+                    print(f"[TILE2-COST] calls={_acc['calls']} dequant_rows_total={_acc['n']} "
+                          f"last_n={int(n)} peak_n={_acc['peak']} "
+                          f"(bytes: codes~{_acc['n']*32/2**20:.1f}MiB "
+                          f"bf16_out~{_acc['n']*2*256/2**20:.1f}MiB)", flush=True)
             if __import__("os").environ.get("SGLANG_TILE2_SEG") == "1":
                 _st = self.__dict__.setdefault("_segchk", {"k": 0})
                 if _st["k"] < 40 and (len(forward_batch.seq_lens) >= 2 or n >= 200):
