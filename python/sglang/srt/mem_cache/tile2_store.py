@@ -724,7 +724,7 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
                 print(f"[TILE2-ARGH] staging mismatch at flush: {nbad}/{len(hit)} rows "
                       f"worse than 5% (worst {float(bad.max()):.3f}) layer={li}", flush=True)
     return dict(k=kq_, v=vq_, mask=mask, slots=slots, tile=int(tile), direct=direct is not None,
-                update_map=update_map, count_tokens=count_tokens, key=key,
+                update_map=update_map, count_tokens=count_tokens, key=key, full=full,
                 n_valid=int(n_valid))
 
 
