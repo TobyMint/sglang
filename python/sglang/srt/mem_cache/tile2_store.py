@@ -1670,6 +1670,14 @@ class Tile2Driver:
             if sent is not None:
                 _ri = torch.where(valid, _ri, torch.full_like(_ri, b.dustbin_pos_row))
             b.pos_slot.index_put_((_ri, pre), loc.to(torch.int32))
+            # `slot_row` is layer-shared and records where each slot currently lives. The host
+            # write path refreshes it, but this graph-safe writer used to update only the ring and
+            # `pos_slot`. A slot recycled from an earlier tile therefore kept that tile's POSITIVE
+            # (packed) tag, and with USE_SROW the kernel classified the new, still-staging tile as
+            # packed and loaded the previous tile's parameters. Codex audit; only reachable with a
+            # radix cache, where slot reuse across requests is the norm.
+            b.slot_row.index_copy_(0, loc.to(torch.long),
+                                   (-(2 + stg * T + fill)).to(torch.int32))
         # mark rows whose tile just closed, for the post-forward flush
         if b.closed is None or b.closed.shape[1] < rows.numel():
             b.closed = torch.full((b.L, max(4096, int(rows.numel()))), -1,
