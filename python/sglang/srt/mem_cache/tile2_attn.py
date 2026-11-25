@@ -616,6 +616,8 @@ def fused_decode(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         G=hq // buf.H, HQ=hq, BQ_=max(16, hq // buf.H), BN=bn,
         USE_SROW=getattr(buf, "radix_on", True),
     )
+    if _DBG_REGS:
+        _report_regs(_tile2_fused_decode_kernel, "fused_decode")
     try:
         from sglang.srt.mem_cache.tile2_store import _prof_add as _pa
         _pa("fused", _tf.perf_counter() - _tf0)
