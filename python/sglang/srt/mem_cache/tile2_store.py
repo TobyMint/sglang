@@ -1038,8 +1038,11 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
         # per-tile `.min()` this replaces was one of the two device->host reads per tile (~1.2k per
         # 2048-token chunk) and every one of them drained the stream.
         _pos_ok = False
-        if (buf.pos_slot is not None and _ONEPASS and update_map and n > 1
-                and not track_positions):
+        if (buf.pos_slot is not None and _ONEPASS and n > 1 and not track_positions):
+            # NOTE: this must NOT be gated on `update_map`. `update_map` is only True on the start
+            # layer (the one-pass write), but pos_slot persists unchanged for layers 1..35, so the
+            # validation is valid on every layer. Gating it on update_map left the per-tile
+            # `.min()` running on 35 of 36 layers.
             _pos_ok = int(buf.pos_slot[ridx[i], p:p + n].min()) >= 0
         while j < end:
             take = min(end - j, buf.T - fill)
