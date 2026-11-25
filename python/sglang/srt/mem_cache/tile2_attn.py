@@ -38,6 +38,11 @@ from __future__ import annotations
 #: SGLANG_TILE2_RECENT=R reads the most recent R positions from the bf16 landing window instead
 #: of the packed codes (R <= 128 = one ring). Default 0 reproduces the tile-aligned behaviour.
 _RECENT = int(__import__("os").environ.get("SGLANG_TILE2_RECENT", "0"))
+#: SGLANG_TILE2_NODQ=1 skips the per-element affine in the K dequantisation. DIAGNOSTIC ONLY --
+#: the outputs are wrong. It measures the cost of the `ck * sA + lA` that D3's third step would
+#: remove (fold sA into q, lA into a constant), which is blocked today because staged and packed
+#: rows share one tl.dot and therefore one affine semantics.
+_NODQ = __import__("os").environ.get("SGLANG_TILE2_NODQ") == "1"
 if _RECENT:
     print(f"[TILE2] decode read path: the last {_RECENT} positions come from the bf16 landing "
           f"window; the rest from the packed codes", flush=True)
@@ -263,6 +268,7 @@ def _tile2_split_decode_kernel(
     G: tl.constexpr, HQ: tl.constexpr, BQ_: tl.constexpr, BN: tl.constexpr,
     SPLITS: tl.constexpr, ROT: tl.constexpr = False, USE_SROW: tl.constexpr = True,
     RECENT: tl.constexpr = 0,
+    NODQ: tl.constexpr = False,
 ):
     """Stage 1 of split-K flash decoding.
 
@@ -367,7 +373,13 @@ def _tile2_split_decode_kernel(
                        * tl.load(VB + ptr, mask=okp, other=0.0).to(tl.float32))
                 b_v = (tl.load(VL + ptr, mask=okp, other=0.0).to(tl.float32)
                        * tl.load(VB + ptr, mask=okp, other=0.0).to(tl.float32))
-                khat = (ck * sA[None, :] + lA[None, :]).to(tl.bfloat16)             # [BN, D]
+                if NODQ:
+                    # DIAGNOSTIC ONLY: drops the per-element affine. Results are wrong; this
+                    # exists to measure what the dequantisation ALU costs, the same way
+                    # SGLANG_TILE2_ITERS=0 does for VarN and NOROT does for the rotation.
+                    khat = ck.to(tl.bfloat16)
+                else:
+                    khat = (ck * sA[None, :] + lA[None, :]).to(tl.bfloat16)             # [BN, D]
 
                 fb = valid & ~okp
                 if RECENT > 0:
@@ -512,6 +524,7 @@ def fused_decode_split(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         ROT=rot_fused,
         USE_SROW=getattr(buf, "radix_on", True),
         RECENT=_RECENT,
+        NODQ=_NODQ,
         num_warps=int(__import__("os").environ.get("SGLANG_TILE2_WARPS", "4")),
         num_stages=int(__import__("os").environ.get("SGLANG_TILE2_STAGES", "2")),
     )
