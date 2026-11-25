@@ -38,6 +38,34 @@ from __future__ import annotations
 #: SGLANG_TILE2_RECENT=R reads the most recent R positions from the bf16 landing window instead
 #: of the packed codes (R <= 128 = one ring). Default 0 reproduces the tile-aligned behaviour.
 _RECENT = int(__import__("os").environ.get("SGLANG_TILE2_RECENT", "0"))
+#: SGLANG_TILE2_REGS=1 reports the compiled kernel's register count, local-memory spills and
+#: shared-memory use after the first launch. Register pressure is what caps this kernel at 3
+#: blocks/SM (168 regs/thread -> 19.7% occupancy -> 13% of peak bandwidth), so every change aimed
+#: at occupancy has to be judged on this number before a benchmark is worth running.
+_DBG_REGS = __import__("os").environ.get("SGLANG_TILE2_REGS") == "1"
+
+
+def _report_regs(jitfn, tag: str) -> None:
+    try:
+        caches = getattr(jitfn, "device_caches", None) or getattr(jitfn, "cache", None)
+        if not caches:
+            print(f"[TILE2-REGS] {tag}: 没有编译缓存", flush=True)
+            return
+        for _dev, entry in caches.items():
+            kc = entry[0] if isinstance(entry, tuple) else entry
+            items = kc.items() if hasattr(kc, "items") else []
+            for _key, kern in items:
+                md = getattr(kern, "metadata", None)
+                print(f"[TILE2-REGS] {tag} regs={getattr(kern, 'n_regs', '?')} "
+                      f"spills={getattr(kern, 'n_spills', '?')} "
+                      f"smem={getattr(md, 'shared', '?')} "
+                      f"warps={getattr(md, 'num_warps', '?')} "
+                      f"stages={getattr(md, 'num_stages', '?')}", flush=True)
+                return
+        print(f"[TILE2-REGS] {tag}: 缓存为空", flush=True)
+    except Exception as exc:                      # Triton internals move between versions
+        print(f"[TILE2-REGS] {tag}: 读取失败 {type(exc).__name__}: {exc}", flush=True)
+
 #: SGLANG_TILE2_NODQ=1 skips the per-element affine in the K dequantisation. DIAGNOSTIC ONLY --
 #: the outputs are wrong. It measures the cost of the `ck * sA + lA` that D3's third step would
 #: remove (fold sA into q, lA into a constant), which is blocked today because staged and packed
@@ -543,6 +571,8 @@ def fused_decode_split(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
         mido, midlse, out.view(-1, buf.D), hmat,
         D=buf.D, SPLITS=splits, HQ=hq, ROT=rot_fused,
     )
+    if _DBG_REGS:
+        _report_regs(_tile2_split_decode_kernel, "split_decode")
     return True
 
 
