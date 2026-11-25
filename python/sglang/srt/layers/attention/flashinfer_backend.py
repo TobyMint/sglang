@@ -12,6 +12,12 @@ import os as _os
 #: SGLANG_TILE2_COST=1 prints the prefill dequant volume (no timing, no sync).
 _T2_COST = _os.environ.get("SGLANG_TILE2_COST") == "1"
 
+#: SGLANG_TILE2_NOUNROT=1 skips the prefill un-rotation of the dequantised prefix workspace.
+#: DIAGNOSTIC ONLY -- the attention then consumes Hadamard-domain K/V and every result is wrong.
+#: It exists to price that step: for a 16K prompt the prefix totals ~1.55M rows, and the block
+#: does two fp32 matmuls plus several full-tensor passes over them.
+_T2_NOUNROT = _os.environ.get("SGLANG_TILE2_NOUNROT") == "1"
+
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -1060,7 +1066,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     _t2k(buf, layer.layer_id - pool.start_layer, idx[:n], cur[0][:n], cur[1][:n])
                 else:
                     _t2t(buf, layer.layer_id - pool.start_layer, idx[:n], cur[0][:n], cur[1][:n])
-                if buf.unrotate:
+                if buf.unrotate and not _T2_NOUNROT:
                     # Only the packed rows are in the Hadamard domain; staging holds the model's own
                     # values, so the transform is applied to a copy and blended on a device mask.
                     hk = buf.Hk()
