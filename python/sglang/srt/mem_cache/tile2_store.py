@@ -688,17 +688,11 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
     else:
         k = buf.staging_k[li, base:base + n_valid]
         v = buf.staging_v[li, base:base + n_valid]
-    mask = torch.zeros(buf.T, dtype=torch.bool, device=buf.device)
-    mask[:n_valid] = True
-    #: True iff every row of the tile is valid and ours. The commit can then take the unmasked
-    #: index_copy path without reading `mask.all()` back to the host (that was one device->host
-    #: sync per tile per layer). A padded tail or rows inherited through the radix cache keeps
-    #: the masked path.
+    #: True iff every row of the tile is valid and ours. The commit then takes the unmasked
+    #: index_copy path with no device->host read. The per-tile [T] mask is gone: `n_valid` and
+    #: `own_mask` travel with the ctx and `drain_flushes` builds ONE [N,T] mask for the layer
+    #: (one tensor fill instead of two kernels per tile).
     full = n_valid == buf.T and own_mask is None
-    if own_mask is not None:
-        mask[:own_mask.numel()] &= own_mask
-        if not bool(mask.any()):
-            return None
     if n_valid < buf.T:                       # pad with zeros; the mask keeps them out of the stats
         pad = buf.T - n_valid
         k = torch.cat([k, torch.zeros(pad, buf.H, buf.D, dtype=k.dtype, device=k.device)], 0)
@@ -723,9 +717,39 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
             if nbad:
                 print(f"[TILE2-ARGH] staging mismatch at flush: {nbad}/{len(hit)} rows "
                       f"worse than 5% (worst {float(bad.max()):.3f}) layer={li}", flush=True)
-    return dict(k=kq_, v=vq_, mask=mask, slots=slots, tile=int(tile), direct=direct is not None,
+    return dict(k=kq_, v=vq_, slots=slots, tile=int(tile), direct=direct is not None,
                 update_map=update_map, count_tokens=count_tokens, key=key, full=full,
-                n_valid=int(n_valid))
+                own_mask=own_mask, n_valid=int(n_valid))
+
+
+#: Cached all-ones masks, one per (device, N, T). Constant, never mutated, safe to share across
+#: layers (the quantiser only reads it).
+_ONES_MASKS: dict = {}
+
+
+def _ones_mask(device, n: int, T: int) -> torch.Tensor:
+    key = (str(device), int(n), int(T))
+    m = _ONES_MASKS.get(key)
+    if m is None:
+        if len(_ONES_MASKS) > 64:
+            _ONES_MASKS.clear()
+        m = torch.ones((n, T), dtype=torch.bool, device=device)
+        _ONES_MASKS[key] = m
+    return m
+
+
+def _build_mask(buf: Tile2Buffers, ctx: dict) -> torch.Tensor:
+    """The [T] row mask of one staged tile (used by the immediate diagnostic paths only)."""
+    if ctx.get("full", False):
+        return _ones_mask(buf.device, 1, buf.T)[0]
+    mask = torch.ones(buf.T, dtype=torch.bool, device=buf.device)
+    nv = ctx["n_valid"]
+    if nv < buf.T:
+        mask[nv:] = False
+    om = ctx["own_mask"]
+    if om is not None:
+        mask[:om.numel()] &= om
+    return mask
 
 
 def tile_for_slots(buf: Tile2Buffers, tile_of, key, ti, slots):
@@ -748,7 +772,10 @@ def tile_for_slots(buf: Tile2Buffers, tile_of, key, ti, slots):
 
 def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
     """Write one tile's codes, its eight parameter planes and its routing entry."""
-    slots, mask = ctx["slots"], ctx["mask"]
+    slots = ctx["slots"]
+    if not ctx.get("full", False) and ctx.get("mask") is None:
+        ctx["mask"] = _build_mask(buf, ctx)
+    mask = ctx.get("mask")
     tile, update_map = ctx["tile"], ctx["update_map"]
     count_tokens, key = ctx["count_tokens"], ctx["key"]
     kq_, n_valid = ctx["k"], ctx["n_valid"]
@@ -845,7 +872,7 @@ def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
     if ctx is not None and os.environ.get("SGLANG_TILE2_FLUSH_NOW") == "1":
         # Diagnostic: quantise immediately (pre-batching behaviour) so an A/B can tell whether
         # deferring the quantisation to the end of the layer changed anything numerically.
-        _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
+        _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], _build_mask(buf, ctx),
                                                   bits=buf.bits, iters=_ITERS))
         return
     if ctx is not None:
@@ -856,7 +883,9 @@ def queue_flush(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
         if not ctx.get("direct"):
             ctx["k"] = ctx["k"].clone()
             ctx["v"] = ctx["v"].clone()
-        ctx["slots"] = ctx["slots"].clone()
+        # `slots` is LEFT as a view: `drain_flushes` concatenates the layer's tiles into one
+        # [N*T] tensor, which copies anyway, and nothing touches pos_slot/req_to_token between
+        # now and then. The per-tile `.clone()` this replaces was one DtoD copy per tile.
         _flush_q(buf).setdefault(li, []).append(ctx)
 
 
@@ -864,19 +893,94 @@ def drain_flushes(buf: Tile2Buffers, li: int) -> None:
     q = _flush_q(buf).pop(li, None)
     if not q:
         return
+    T = buf.T
+    any_own = any(c["own_mask"] is not None for c in q)
+    full_all = not any_own and all(c.get("full", False) for c in q)
+    if full_all:
+        masks = None
+    else:
+        masks = torch.zeros((len(q), T), dtype=torch.bool, device=buf.device)
+        for i, c in enumerate(q):
+            masks[i, :c["n_valid"]] = True
+            om = c["own_mask"]
+            if om is not None:
+                masks[i, :om.numel()] &= om
+        if any_own:
+            # A tile can be fully inherited (radix): it has no rows of its own and must not be
+            # packed / must not have its parameters written. One reduction per layer; radix off
+            # never reaches this.
+            keep_rows = masks.any(dim=1)
+            if not bool(keep_rows.all()):
+                keep = [i for i, v in enumerate(keep_rows.tolist()) if v]
+                if not keep:
+                    return
+                q = [q[i] for i in keep]
+                masks = masks[keep]
     ks = torch.stack([c["k"] for c in q])
     vs = torch.stack([c["v"] for c in q])
-    ms = torch.stack([c["mask"] for c in q])
+    ms = masks if masks is not None else _ones_mask(buf.device, len(q), T)
     if _QFUSED:
         from sglang.srt.mem_cache.tile2_quant_fused import quantise_tiles_fused
         allp = quantise_tiles_fused(ks, vs, ms, iters=_ITERS, bits=buf.bits)
     else:
         allp = quantise_tiles(ks, vs, ms, bits=buf.bits, iters=_ITERS)
-    if len(q) == 1:
-        _flush_commit(buf, li, q[0], {n: t[0] for n, t in allp.items()})
-        return
-    for i, ctx in enumerate(q):
-        _flush_commit(buf, li, ctx, {n: t[i] for n, t in allp.items()})
+    _flush_commit_batch(buf, li, q, allp, masks)
+
+
+def _flush_commit_batch(buf: Tile2Buffers, li: int, q: list, allp: dict, masks) -> None:
+    """One commit for every tile that closed in this layer.
+
+    Before this, each tile did its own two payload index_copies, eight parameter-plane writes,
+    a slot_row index_copy and a packed-counter bump -- roughly 30 small device ops per tile, 16
+    tiles per layer, i.e. the bulk of the 16k CUDA API calls a chunk. Everything here is per
+    layer: 2 payload copies, 8 plane writes, 1 slot_row copy, 1 counter bump per request.
+    """
+    N, T = len(q), buf.T
+    full_all = masks is None
+    slots_all = torch.cat([c["slots"] for c in q])
+    if slots_all.dtype != torch.long:
+        slots_all = slots_all.to(torch.long)
+    tiles = torch.tensor([c["tile"] for c in q], dtype=torch.long, device=buf.device)
+    codes_k = allp["codes_k"].reshape(N * T, *allp["codes_k"].shape[2:])
+    codes_v = allp["codes_v"].reshape(N * T, *allp["codes_v"].shape[2:])
+    k_plane, v_plane = buf.k_codes[li], buf.v_codes[li]
+    if full_all:
+        idx = None
+        slots_sel = slots_all
+    else:
+        idx = masks.reshape(-1).nonzero().squeeze(1)
+        slots_sel = slots_all.index_select(0, idx)
+    if full_all:
+        k_plane.index_copy_(0, slots_sel, codes_k)
+        v_plane.index_copy_(0, slots_sel, codes_v)
+    else:
+        k_plane.index_copy_(0, slots_sel, codes_k.index_select(0, idx))
+        v_plane.index_copy_(0, slots_sel, codes_v.index_select(0, idx))
+    for name in buf.PARAM_SHAPES:
+        getattr(buf, name)[li, tiles] = allp[name]
+    if q[0]["update_map"]:
+        off = _ramp(buf, T)
+        vals = (tiles.to(torch.int32)[:, None] * T + off[None, :]).reshape(-1)
+        if full_all:
+            buf.slot_row.index_copy_(0, slots_sel, vals)
+        else:
+            buf.slot_row.index_copy_(0, slots_sel, vals.index_select(0, idx))
+    if buf.packed_ntiles is not None:
+        counts = {}
+        for c in q:
+            k = c["key"]
+            if k is not None:
+                counts[k] = counts.get(k, 0) + 1
+        for k, n in counts.items():
+            buf.packed_ntiles[li, k] += n
+    if getattr(buf, "page_bound", False):
+        for c in q:
+            t = int(c["tile"])
+            buf.page_ready_layers[t] |= int(1 << li)
+            if int(buf.page_ready_layers[t]) == int(buf._layers_mask):
+                buf.page_generation[t] += 1
+    if q[0]["count_tokens"]:
+        buf.n_packed_tokens = getattr(buf, "n_packed_tokens", 0) + T * N
 
 
 def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
@@ -887,7 +991,7 @@ def flush_tile(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int,
                          req_row, key, own_mask)
     if ctx is None:
         return
-    _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], ctx["mask"],
+    _flush_commit(buf, li, ctx, quantise_tile(ctx["k"], ctx["v"], _build_mask(buf, ctx),
                                               bits=buf.bits, iters=_ITERS))
 
 
