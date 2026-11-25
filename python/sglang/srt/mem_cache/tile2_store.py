@@ -690,6 +690,11 @@ def _flush_prepare(buf: Tile2Buffers, li: int, stg: int, n_valid: int, tile: int
         v = buf.staging_v[li, base:base + n_valid]
     mask = torch.zeros(buf.T, dtype=torch.bool, device=buf.device)
     mask[:n_valid] = True
+    #: True iff every row of the tile is valid and ours. The commit can then take the unmasked
+    #: index_copy path without reading `mask.all()` back to the host (that was one device->host
+    #: sync per tile per layer). A padded tail or rows inherited through the radix cache keeps
+    #: the masked path.
+    full = n_valid == buf.T and own_mask is None
     if own_mask is not None:
         mask[:own_mask.numel()] &= own_mask
         if not bool(mask.any()):
@@ -775,7 +780,7 @@ def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
                   f"slots[0]={int(slots[0])} slots[-1]={int(slots[-1])}", flush=True)
         else:
             buf._param_owner[key] = buf._cur_row
-    if bool(mask.all()):
+    if ctx.get("full", False):
         buf.k_codes[li].index_copy_(0, slots, parts["codes_k"])
         buf.v_codes[li].index_copy_(0, slots, parts["codes_v"])
     else:
@@ -784,8 +789,8 @@ def _flush_commit(buf: Tile2Buffers, li: int, ctx: dict, parts: dict) -> None:
     for name in buf.PARAM_SHAPES:
         getattr(buf, name)[li, tile] = parts[name]
     if update_map:
-        off = torch.arange(buf.T, dtype=torch.int32, device=buf.device)
-        if bool(mask.all()):
+        off = _ramp(buf, buf.T)
+        if ctx.get("full", False):
             buf.slot_row.index_copy_(0, slots, (tile * buf.T + off))
         else:
             buf.slot_row.index_copy_(0, slots[mask], (tile * buf.T + off)[mask])
@@ -1027,6 +1032,15 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
             buf.slot_row.index_copy_(
                 0, loc[j:j + n].to(torch.long),
                 -(2 + stg * buf.T + (_pos_all % buf.T).to(torch.int32)))
+        # Validate the chunk's position table ONCE per layer instead of once per tile. `pos_slot`
+        # is written for this chunk by the layer-0 one-pass above and persists for layers 1..35, so
+        # a single `.min()` over the written range proves every tile close below may use it. The
+        # per-tile `.min()` this replaces was one of the two device->host reads per tile (~1.2k per
+        # 2048-token chunk) and every one of them drained the stream.
+        _pos_ok = False
+        if (buf.pos_slot is not None and _ONEPASS and update_map and n > 1
+                and not track_positions):
+            _pos_ok = int(buf.pos_slot[ridx[i], p:p + n].min()) >= 0
         while j < end:
             take = min(end - j, buf.T - fill)
             if fill == 0:
@@ -1085,7 +1099,7 @@ def write_and_flush(buf: Tile2Buffers, li: int, stg_of, pre_lens, n_writes, rows
                     _ri_tile = ridx[i] if ridx is not None else (
                         ridx_of(int(key)) if ridx_of is not None else int(row))
                     cand = buf.pos_slot[_ri_tile, p - buf.T:p]
-                    if int(cand.numel()) == buf.T and int(cand.min()) >= 0:
+                    if int(cand.numel()) == buf.T and (_pos_ok or int(cand.min()) >= 0):
                         slots = cand.to(torch.long)
                         nacc = buf.T
                 if slots is None and pending is not None:
