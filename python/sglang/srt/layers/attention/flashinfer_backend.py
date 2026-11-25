@@ -1065,10 +1065,15 @@ class FlashInferAttnBackend(AttentionBackend):
                     # values, so the transform is applied to a copy and blended on a device mask.
                     hk = buf.Hk()
                     m = (buf.slot_row.index_select(0, idx[:n].to(torch.long)) >= 0).view(-1, 1, 1)
-                    rk = cur[0][:n].float() @ hk
-                    rv = cur[1][:n].float() @ hk
-                    cur[0][:n].copy_(torch.where(m, rk, cur[0][:n].float()).to(torch.bfloat16))
-                    cur[1][:n].copy_(torch.where(m, rv, cur[1][:n].float()).to(torch.bfloat16))
+                    # One fp32 conversion per tensor, not two. The old code cast `cur` again
+                    # inside the `where`, so every layer-chunk paid a full bf16->fp32 conversion
+                    # (and its temporary) twice per tensor on top of the matmul.
+                    kf = cur[0][:n].float()
+                    vf = cur[1][:n].float()
+                    rk = kf @ hk
+                    rv = vf @ hk
+                    cur[0][:n].copy_(torch.where(m, rk, kf).to(torch.bfloat16))
+                    cur[1][:n].copy_(torch.where(m, rv, vf).to(torch.bfloat16))
             elif buf.unrotate:
                 # Gather in float32 and un-rotate there, so the reconstruction is rounded to bf16
                 # exactly once -- same as the in-place QDQ arm. With a bf16 scratch the value is
