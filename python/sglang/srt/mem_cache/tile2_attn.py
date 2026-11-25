@@ -376,11 +376,6 @@ def _tile2_split_decode_kernel(
                 kaddr = (slots[:, None] * H + h) * (D // 4) + db[None, :]
                 u = tl.load(KC + kaddr, mask=ok[:, None], other=0)
                 ck = tl.reshape((u[:, :, None] >> sh4[None, None, :]) & 3, (BN, D)).to(tl.float32)
-                w = tl.load(VC + kaddr, mask=ok[:, None], other=0)
-                # Codes are 0..3, exact in bf16, and this split kernel only feeds them straight
-                # into a bf16 dot -- unpacking to bf16 skips an fp32 [BN, D] temporary, which
-                # matters here because register pressure is what caps occupancy at 3 blocks/SM.
-                cv = tl.reshape((w[:, :, None] >> sh4[None, None, :]) & 3, (BN, D)).to(tl.bfloat16)
                 srow = tl.load(SROW + slots, mask=ok, other=-1).to(tl.int64)
                 okp = ok & (srow >= 0)
                 safe_srow = tl.where(okp, srow, 0)
@@ -440,6 +435,11 @@ def _tile2_split_decode_kernel(
                 khat = tl.where(fb[:, None], kf, khat).to(tl.bfloat16)
                 # bf16 for the dot; raw codes are 0..3 so they are exact there, and staged
                 # rows carry their true value through the identity factors.
+                # V is loaded HERE, not next to the K load above: nothing between the two needs it,
+                # and holding a [BN, D] tile across the whole score path costs registers that this
+                # kernel cannot spare (168/thread puts only 3 blocks on an SM).
+                w = tl.load(VC + kaddr, mask=ok[:, None], other=0)
+                cv = tl.reshape((w[:, :, None] >> sh4[None, None, :]) & 3, (BN, D)).to(tl.bfloat16)
                 vcode = tl.where(fb[:, None], vf, cv)
                 sA_eff = sA
                 m_extra = None
