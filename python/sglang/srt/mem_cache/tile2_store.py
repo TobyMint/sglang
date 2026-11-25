@@ -1529,7 +1529,13 @@ class Tile2Driver:
             # rows' `out_cache_loc`, and padded tokens are REDIRECTED to these dustbin rows rather
             # than filtered out -- filtering needs `nonzero`, whose data-dependent shape capture
             # rejects. The extra pos_slot row and the last staging row are never read by anyone.
-            b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
+            # Slot 0 is the spare one, NOT `size`. The page-size-one allocator hands out
+            # `arange(1, size + 1)`, i.e. 1..size inclusive, so `size` is a REAL slot a live
+            # request can own. Using it as the sentinel meant a token that happened to be
+            # allocated slot `size` had its K/V and position-map write redirected to the dustbin,
+            # leaving attention to read stale data. Slot 0 is never handed out (the allocator's
+            # own comment calls it "the padded slot 0"), so it is the safe spare.
+            b.pad_sentinel = 0
             b.dustbin_pos_row = int(REQ_SLOTS)
             b.dustbin_stg_row = int(b.max_staging * b.T)   # the extra row, outside every slot
         if b.ridx_tab is None:
@@ -1609,7 +1615,7 @@ class Tile2Driver:
             # rows' `out_cache_loc`, and padded tokens are REDIRECTED to these dustbin rows rather
             # than filtered out -- filtering needs `nonzero`, whose data-dependent shape capture
             # rejects. The extra pos_slot row and the last staging row are never read by anyone.
-            b.pad_sentinel = int(b.size)              # spare KV slot: slots = size + page_size
+            b.pad_sentinel = 0    # slot 0 is the spare one; `size` is a real slot (see above)
             b.dustbin_pos_row = int(REQ_SLOTS)
             b.dustbin_stg_row = int(b.max_staging * b.T)   # the extra row, outside every slot
         if b.ridx_tab is None:
