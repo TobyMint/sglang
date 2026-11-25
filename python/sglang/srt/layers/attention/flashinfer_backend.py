@@ -719,7 +719,10 @@ class FlashInferAttnBackend(AttentionBackend):
             self._t2f_lens[:_bs].copy_(forward_batch.seq_lens.to(torch.int32))
             self._t2f_q[:_bs].copy_(q.view(_bs, _hq, _d).to(torch.bfloat16))
             _li_f = layer.layer_id - _p.start_layer
-            _splits = int(__import__("os").environ.get("SGLANG_TILE2_SPLITS", "0"))
+            # Default 32: measured best at 16K/batch8 (attention 25.75 ms/step at 8 vs 21.66 at 32,
+            # combine 0.52 -> 1.64 ms). SGLANG_TILE2_SPLITS can still override it; 0/1 keeps the
+            # original unsplit kernel. See REPORT_decode.md §7.
+            _splits = int(__import__("os").environ.get("SGLANG_TILE2_SPLITS", "32"))
             if _splits > 1:
                 # Split-K: one program per (request, kv head, split). The unsplit kernel puts only
                 # 8 requests x 8 kv heads = 64 programs on 82 SMs, so the GPU is idle while each

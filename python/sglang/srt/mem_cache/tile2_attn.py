@@ -530,8 +530,14 @@ def _tile2_split_combine_kernel(MIDO, MIDLSE, OUT, HMAT,
 def fused_decode_split(buf, li: int, q_rot: torch.Tensor, rows: torch.Tensor,
                        lens: torch.Tensor, packed_ntiles: torch.Tensor,
                        out: torch.Tensor, scale: float, scratch,
-                       splits: int = 8, bn: int = 32, rot_fused: bool = False,
+                       splits: int = 32, bn: int = 32, rot_fused: bool = False,
                        qrot=None) -> bool:
+    """Split-K flash decoding. `splits=32` is the tuned default (see REPORT_decode.md §7):
+
+    16K / batch 8 / B3000-class card measured attention 25.75 ms/step at splits=8 vs 21.66 at 32
+    (combine 0.52 -> 1.64 ms, still ~1/13 of what it saves). splits=16 was 22.17, splits=4 was
+    34.37, and pushing further to 64 does not pay for the combine. SGLANG_TILE2_SPLITS still
+    overrides this at runtime (see flashinfer_backend.forward_decode)."""
     if not HAVE_TRITON or buf.D != 128 or buf.T % bn or splits < 1:
         return False
     hq = q_rot.shape[1]
